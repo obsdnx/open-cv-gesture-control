@@ -5,9 +5,9 @@ SCREEN_W, SCREEN_H = pyautogui.size()
 # Camera capture index (0 = built-in webcam)
 CAMERA_INDEX = 0
 
-# Frame display size
-FRAME_W = 640
-FRAME_H = 480
+# Frame display size (lower = faster MediaPipe processing)
+FRAME_W = 320
+FRAME_H = 240
 
 # The region of the frame used for cursor mapping (avoids edges)
 # Values are fractions of frame dimensions

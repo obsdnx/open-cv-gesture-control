@@ -16,6 +16,7 @@ from gesture_control import (
     HandTracker, Gesture, recognize, index_tip_position,
     WindowController, config,
 )
+from gesture_control.camera import FFmpegCamera
 
 
 GESTURE_LABELS = {
@@ -86,24 +87,38 @@ def run(camera: int, show_window: bool):
     tracker = HandTracker()
     controller = WindowController()
 
-    cap = cv2.VideoCapture(camera)
+    import time
+
+    # Try OpenCV first (lowest latency). Fall back to ffmpeg if unavailable.
+    print("Opening camera…", flush=True)
+    cap = cv2.VideoCapture(camera, cv2.CAP_AVFOUNDATION)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, config.FRAME_W)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.FRAME_H)
+    cap.set(cv2.CAP_PROP_FPS, 30)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # discard stale frames
 
-    if not cap.isOpened():
-        print(f"ERROR: cannot open camera {camera}", file=sys.stderr)
-        sys.exit(1)
+    time.sleep(0.5)
+    ok, _ = cap.read()
+
+    if not cap.isOpened() or not ok:
+        print("OpenCV camera unavailable, falling back to ffmpeg…", flush=True)
+        cap.release()
+        cap = FFmpegCamera(device_index=camera, width=config.FRAME_W, height=config.FRAME_H)
+        time.sleep(1.0)
+        if not cap.isOpened():
+            print(f"ERROR: cannot open camera {camera}", file=sys.stderr)
+            sys.exit(1)
 
     print("Gesture control running. Press Q (in preview) or Ctrl-C to quit.")
 
-    import time
     prev_time = time.time()
     show_legend = True
 
     while True:
         ok, frame = cap.read()
         if not ok:
-            break
+            time.sleep(0.01)
+            continue
 
         frame = cv2.flip(frame, 1)  # mirror so left hand = left on screen
         hand, annotated = tracker.process(frame)
