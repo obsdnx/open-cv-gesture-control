@@ -32,8 +32,9 @@
  *
  * USAGE
  *   ./gesture_control                  (built-in camera, with preview)
+ *   ./gesture_control --list           (print cameras and their indices)
  *   ./gesture_control --no-window      (headless)
- *   ./gesture_control --camera 1       (external camera)
+ *   ./gesture_control --camera 1       (pick a camera from --list)
  *   ./gesture_control --debug          (overlay skin mask / hull)
  *
  * PERMISSIONS REQUIRED (macOS)
@@ -139,9 +140,10 @@ static void draw_hud(cv::Mat       &frame,
  * ========================================================================= */
 
 struct Args {
-    int  camera     = 0;
+    int  camera     = CAMERA_AUTO;   /* built-in camera unless --camera N */
     bool no_window  = false;
     bool debug      = false;
+    bool list       = false;
 };
 
 static Args parse_args(int argc, char **argv)
@@ -150,6 +152,7 @@ static Args parse_args(int argc, char **argv)
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--no-window") == 0) a.no_window = true;
         if (strcmp(argv[i], "--debug")     == 0) a.debug     = true;
+        if (strcmp(argv[i], "--list")      == 0) a.list      = true;
         if (strcmp(argv[i], "--camera") == 0 && i+1 < argc)
             a.camera = atoi(argv[++i]);
     }
@@ -163,6 +166,8 @@ static Args parse_args(int argc, char **argv)
 int main(int argc, char **argv)
 {
     Args args = parse_args(argc, argv);
+
+    if (args.list) { camera_list(); return 0; }
 
     /* --- Open camera --- */
     Camera cam = {};

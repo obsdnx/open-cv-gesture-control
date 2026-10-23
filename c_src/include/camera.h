@@ -1,51 +1,60 @@
 /*
- * camera.h — thin wrapper around OpenCV VideoCapture.
+ * camera.h — native macOS camera capture (AVFoundation), exposed as plain C.
  *
- * WHY A WRAPPER?
- * We hide the OpenCV C++ object behind a plain C struct so that
- * main.cpp and gesture.cpp don't need to know it's OpenCV underneath.
- * If we ever swap to AVFoundation or ffmpeg we only change camera.cpp.
+ * WHY NOT cv::VideoCapture?
+ *   1. Device order is unpredictable. With an iPhone nearby, macOS
+ *      "Continuity Camera" registers the phone as a webcam and OpenCV's
+ *      index 0 may be the phone — giving black frames (phone locked) or
+ *      heavy lag (frames travel over Wi-Fi).
+ *   2. OpenCV's own permission check is unreliable on recent macOS.
+ *   3. OpenCV queues frames internally; we want only the newest one.
+ *
+ * camera.mm talks to AVFoundation directly:
+ *   - picks the BUILT-IN camera by device type, not by index
+ *   - sets alwaysDiscardsLateVideoFrames = YES  → zero frame backlog
+ *   - converts each frame to a cv::Mat (BGR) on a background queue
+ *
+ * The Objective-C objects are hidden behind a void* so callers
+ * (main.cpp) stay plain C++ and never see Objective-C syntax.
  *
  * USAGE:
  *   Camera cam;
- *   if (camera_open(&cam, 0, 320, 240) != 0) { ... error ... }
+ *   camera_open(&cam, CAMERA_AUTO, 320, 240);
  *   cv::Mat frame;
- *   while (camera_read(&cam, &frame)) { ... process frame ... }
+ *   while (camera_read(&cam, &frame)) { ... }
  *   camera_close(&cam);
  */
 
 #pragma once
-#include <opencv2/opencv.hpp>
+#include <opencv2/core.hpp>
 #include "types.h"
 
-/* Opaque handle — callers treat this as a black box. */
+/* Pass as `device` to select the built-in FaceTime camera automatically. */
+#define CAMERA_AUTO (-1)
+
 typedef struct {
-    cv::VideoCapture *cap;   /* heap-allocated so C++ ctor runs properly */
-    int width;
-    int height;
+    void *impl;    /* CameraImpl* (Objective-C++ internals, see camera.mm) */
+    int   width;   /* size of frames returned by camera_read               */
+    int   height;
 } Camera;
 
+/* Print every camera macOS can see, with the index to pass to --camera. */
+void camera_list(void);
+
 /*
- * camera_open — initialise the camera.
- *
- *   device  : OS device index (0 = built-in FaceTime webcam on Mac)
- *   width/h : requested resolution; actual may differ slightly
- *
- * Returns 0 on success, -1 if the device cannot be opened.
- * Prints a diagnostic message on failure.
+ * camera_open — start capturing.
+ *   device : CAMERA_AUTO (built-in camera) or an index from camera_list()
+ *   width/height : size of the frames handed to the caller (resized
+ *                  from the 640x480 sensor stream)
+ * Returns 0 on success, -1 on failure (prints the reason).
  */
 int  camera_open (Camera *cam, int device, int width, int height);
 
 /*
- * camera_read — grab the next frame.
- *
- *   frame : output Mat; caller must declare it but need not allocate.
- *
- * Returns true if a frame was delivered, false on error or end-of-stream.
- * Non-blocking: if no new frame is ready it blocks until one arrives
- * (OpenCV's default grab-decode behaviour).
+ * camera_read — wait for the NEXT new frame (up to 2 s) and copy it out.
+ * Never returns the same frame twice, never returns a stale frame.
+ * Returns false on timeout.
  */
 bool camera_read (Camera *cam, cv::Mat *frame);
 
-/* camera_close — release the device and free memory. */
 void camera_close(Camera *cam);

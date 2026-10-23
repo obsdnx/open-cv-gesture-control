@@ -73,12 +73,6 @@ static void mouse_up(int x, int y)
     CFRelease(e);
 }
 
-static void mouse_click(int x, int y)
-{
-    mouse_down(x, y);
-    mouse_up(x, y);
-}
-
 static void scroll_lines(int lines)
 {
     /* CGScrollEventUnitLine scrolls by logical line units (respects

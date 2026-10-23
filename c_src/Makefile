@@ -33,17 +33,23 @@ OPENCV_LIBS   := -L$(OPENCV_PREFIX)/lib \
                  -lopencv_core     \
                  -lopencv_imgproc  \
                  -lopencv_geometry \
-                 -lopencv_videoio  \
                  -lopencv_highgui
 
 # ---------------------------------------------------------------------------
-# macOS system frameworks (pure C APIs, no Objective-C needed)
+# macOS system frameworks
 #
+#   AVFoundation        — camera capture (camera.mm)
+#   CoreMedia/CoreVideo — frame buffers delivered by AVFoundation
+#   Foundation          — NSArray, NSString used by camera.mm
 #   CoreGraphics        — CGEvent: synthetic mouse + keyboard input
-#   ApplicationServices — higher-level wrapper, required for CGEventPost
-#   CoreFoundation      — CFRelease, CFStringRef (used by CGEvent)
+#   ApplicationServices — required for CGEventPost
+#   CoreFoundation      — CFRelease
 # ---------------------------------------------------------------------------
-MAC_FRAMEWORKS := -framework CoreGraphics        \
+MAC_FRAMEWORKS := -framework AVFoundation         \
+                  -framework CoreMedia            \
+                  -framework CoreVideo            \
+                  -framework Foundation           \
+                  -framework CoreGraphics         \
                   -framework ApplicationServices  \
                   -framework CoreFoundation
 
@@ -56,11 +62,11 @@ INCLUDES := -I include -I $(OPENCV_INC)
 # Source files and derived object paths
 # ---------------------------------------------------------------------------
 SRCS := src/main.cpp       \
-        src/camera.cpp     \
         src/gesture.cpp    \
         src/controller.cpp
 
-OBJS := $(SRCS:src/%.cpp=build/%.o)
+# camera.mm is Objective-C++ (AVFoundation), built with its own rule below
+OBJS := $(SRCS:src/%.cpp=build/%.o) build/camera.o
 
 TARGET := gesture_control
 
@@ -80,6 +86,11 @@ $(TARGET): $(OBJS)
 # automatically trigger recompilation of dependent sources.
 build/%.o: src/%.cpp | build
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -MMD -c $< -o $@
+
+# Objective-C++ files: -fobjc-arc enables automatic reference counting
+# so we never call retain/release by hand.
+build/%.o: src/%.mm | build
+	$(CXX) $(CXXFLAGS) -fobjc-arc $(INCLUDES) -MMD -c $< -o $@
 
 # Create the build directory if it doesn't exist
 build:
