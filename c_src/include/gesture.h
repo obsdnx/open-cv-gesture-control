@@ -1,61 +1,40 @@
 /*
- * gesture.h — find the hand, its fingertip, and whether it is a fist
+ * gesture.h — turn 21 hand joints into a Pose
  *
- * PIPELINE (per frame, no neural network)
- * =======================================
+ * The CNN (hand_model) already did the hard part: it knows where every
+ * joint is. Recognising a pose is now simple geometry, and it works at
+ * any angle (pointing up, sideways, at the camera) because we only
+ * compare distances, never "up" or "down".
  *
- *  1. SKIN MASK
- *     BGR → HSV, rotate hue so red is contiguous, keep pixels inside the
- *     calibrated SkinRange. Result: white = skin, black = everything else.
+ * IS A FINGER EXTENDED?
+ *   Compare how far the fingertip and the finger's middle joint (PIP) are
+ *   from the wrist:
  *
- *  2. REMOVE THE FACE
- *     Your face is skin-coloured and usually bigger than your hand, so it
- *     would "win". A Haar cascade face detector finds the face, and we
- *     black out that rectangle (extended down to cover the neck).
+ *     extended : tip is FARTHER than the middle joint  (finger straight)
+ *     curled   : tip is CLOSER   than the middle joint (folded into palm)
  *
- *  3. CLEAN UP
- *     Morphological open (removes specks) + close (fills holes).
+ *   ratio = dist(wrist, tip) / dist(wrist, PIP) > CFG_FINGER_OUT
  *
- *  4. LARGEST BLOB = HAND
- *     cv::findContours traces every white blob; the biggest is the hand.
+ * POSES
+ *   OK    : thumb tip near index tip  (gap < CFG_OK_PINCH × palm size)
+ *           AND at least two of middle/ring/pinky extended
+ *   FIST  : index, middle, ring and pinky all curled
+ *   POINT : index extended (whatever the others do)
+ *   NONE  : anything else
  *
- *  5. FINGERTIP = TOPMOST POINT
- *     Your arm enters from below, so the highest point of the blob is the
- *     tip of your highest finger. This is what drives the cursor.
- *
- *  6. POSE FROM SOLIDITY
- *     solidity = blob area / convex hull area.
- *       Fist           → compact, almost convex     → solidity ≈ 0.9+
- *       Pointing/open  → fingers leave gaps in hull → solidity lower
- *     solidity > CFG_FIST_SOLIDITY → FIST, else POINT.
- *     Press D in the preview to see the live solidity value and tune it.
+ *   "palm size" = distance wrist → middle knuckle, so all thresholds
+ *   scale with how close you sit to the camera.
  */
 
 #pragma once
-#include <opencv2/core.hpp>
 #include <vector>
 #include "types.h"
+#include "hand_model.h"
 
-/* Extra data for the debug overlay (key D). Not needed for control. */
-struct GestureDebug {
-    cv::Mat                mask;      /* final skin mask, CV_8U             */
-    std::vector<cv::Point> contour;   /* hand outline, processing pixels    */
-    std::vector<cv::Point> hull;      /* convex hull of the hand            */
-    cv::Rect               face;      /* removed face area (may be empty)   */
-};
+/* Classify one hand. frame_w/h normalise positions to [0,1]. */
+HandInfo gesture_classify(const Hand &h, int frame_w, int frame_h);
 
-/* Load the face detector. Call once at startup. Returns false if the
- * cascade file is missing (detection still works, just without face removal). */
-bool gesture_init(void);
+/* Classify every detected hand. */
+HandsResult gesture_analyse(const std::vector<Hand> &hands, int frame_w, int frame_h);
 
-/* Analyse one mirrored BGR frame. `dbg` may be NULL. */
-HandResult gesture_detect(const cv::Mat &frame_bgr,
-                          const SkinRange &skin,
-                          GestureDebug *dbg);
-
-/* Measure the skin colour inside `roi` and return a SkinRange around it.
- * Used by calibration while your hand covers the box on screen. */
-SkinRange gesture_sample_skin(const cv::Mat &frame_bgr, const cv::Rect &roi);
-
-/* Reasonable starting range for most skin tones under indoor light. */
-SkinRange gesture_default_skin(void);
+const char *pose_name(Pose p);

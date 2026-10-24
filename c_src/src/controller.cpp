@@ -1,12 +1,8 @@
 /*
- * controller.cpp — cursor mapping + window grabbing via macOS C APIs
+ * controller.cpp — roles, cursor mapping, press/drag, click, trackpad yield
  *
- *   CoreGraphics (CGEvent)  : moves the mouse cursor
- *   Accessibility (AXUIElement): finds the window under the cursor and
- *                             sets its position
- *
- * Both are plain C APIs from ApplicationServices — no Objective-C here.
- * See controller.h for the behaviour description.
+ * Uses only CoreGraphics CGEvent (a plain C API) to post mouse events.
+ * Behaviour is described in controller.h.
  */
 
 #include "controller.h"
@@ -16,122 +12,75 @@
 #include <cstdio>
 
 /* =========================================================================
- * SECTION 1 — CURSOR OUTPUT
+ * SECTION 1 — MOUSE OUTPUT (CoreGraphics)
  * ========================================================================= */
 
-static void mouse_move(float x, float y)
+static void post_mouse(CGEventType type, float x, float y)
 {
-    CGEventRef e = CGEventCreateMouseEvent(NULL, kCGEventMouseMoved,
-                                           CGPointMake(x, y), kCGMouseButtonLeft);
+    CGEventRef e = CGEventCreateMouseEvent(NULL, type, CGPointMake(x, y), kCGMouseButtonLeft);
+    CGEventSetIntegerValueField(e, kCGMouseEventClickState, 1);
     CGEventPost(kCGHIDEventTap, e);
     CFRelease(e);
 }
 
-/* =========================================================================
- * SECTION 2 — WINDOW ACCESS (Accessibility API)
- *
- * Every on-screen UI item is an AXUIElement. We ask for the element at a
- * screen point, then for its containing window, then read/write that
- * window's "AXPosition" attribute (top-left corner, screen coordinates —
- * the same coordinate system CGEvent uses).
- * ========================================================================= */
-
-static AXUIElementRef window_at(float x, float y)
+/* Where the cursor actually is right now (trackpad included). */
+static CGPoint cursor_now(void)
 {
-    AXUIElementRef sys = AXUIElementCreateSystemWide();
-    AXUIElementRef el  = NULL;
-    AXError err = AXUIElementCopyElementAtPosition(sys, x, y, &el);
-    CFRelease(sys);
-    if (err != kAXErrorSuccess || !el) return NULL;
-
-    /* Is the element itself a window? */
-    CFTypeRef role = NULL;
-    AXUIElementCopyAttributeValue(el, kAXRoleAttribute, &role);
-    bool is_window = role && CFEqual(role, kAXWindowRole);
-    if (role) CFRelease(role);
-    if (is_window) return el;
-
-    /* Otherwise ask for the window that contains it. */
-    CFTypeRef win = NULL;
-    AXUIElementCopyAttributeValue(el, kAXWindowAttribute, &win);
-    CFRelease(el);
-    return (AXUIElementRef)win;     /* may be NULL (desktop, menu bar) */
+    CGEventRef e = CGEventCreate(NULL);
+    CGPoint p = CGEventGetLocation(e);
+    CFRelease(e);
+    return p;
 }
 
-static bool window_get_pos(AXUIElementRef w, float *x, float *y)
-{
-    CFTypeRef v = NULL;
-    if (AXUIElementCopyAttributeValue(w, kAXPositionAttribute, &v) != kAXErrorSuccess || !v)
-        return false;
-    CGPoint p;
-    bool ok = AXValueGetValue((AXValueRef)v, (AXValueType)kAXValueCGPointType, &p);
-    CFRelease(v);
-    *x = (float)p.x; *y = (float)p.y;
-    return ok;
-}
-
-static void window_set_pos(AXUIElementRef w, float x, float y)
-{
-    CGPoint p = CGPointMake(x, y);
-    AXValueRef v = AXValueCreate((AXValueType)kAXValueCGPointType, &p);
-    AXUIElementSetAttributeValue(w, kAXPositionAttribute, v);
-    CFRelease(v);
-}
+double controller_now(void) { return (double)CFAbsoluteTimeGetCurrent(); }
 
 /* =========================================================================
- * SECTION 3 — HELPERS
+ * SECTION 2 — ONE EURO FILTER
  * ========================================================================= */
 
-/* Map v from [lo, hi] onto [0, 1], clamped. */
-static float map01(float v, float lo, float hi)
-{
-    float t = (v - lo) / (hi - lo);
-    return std::max(0.0f, std::min(1.0f, t));
-}
-
-/* Smoothing factor for a first-order low-pass at `cutoff` Hz. */
 static float euro_alpha(float cutoff, float dt)
 {
     float tau = 1.0f / (2.0f * (float)M_PI * cutoff);
     return 1.0f / (1.0f + tau / dt);
 }
 
-/* One Euro filter step for one axis. See controller.h for the idea. */
 static float euro_step(EuroAxis *a, float raw, float dt, const Steadiness *st)
 {
-    if (!a->init) { a->init = true; a->x = a->raw = raw; a->dx = 0; return raw; }
-
-    /* 1. Estimate speed, smoothed with a fixed cutoff. */
-    float speed = (raw - a->raw) / dt;
-    a->dx  += euro_alpha(CFG_EURO_D_CUTOFF, dt) * (speed - a->dx);
-    a->raw  = raw;
-
-    /* 2. Faster movement → higher cutoff → less smoothing. */
-    float cutoff = st->min_cutoff + st->beta * std::fabs(a->dx);
-    a->x += euro_alpha(cutoff, dt) * (raw - a->x);
+    if (!a->init) { *a = EuroAxis{true, raw, 0, raw}; return raw; }
+    float speed = (raw - a->raw) / dt;                      /* 1. speed      */
+    a->dx += euro_alpha(CFG_EURO_D_CUTOFF, dt) * (speed - a->dx);
+    a->raw = raw;
+    float cutoff = st->min_cutoff + st->beta * std::fabs(a->dx); /* 2. adapt */
+    a->x += euro_alpha(cutoff, dt) * (raw - a->x);          /* 3. low-pass   */
     return a->x;
 }
 
-/* Filter (tx, ty) into the cursor position. */
-static void smooth_to(ControllerState *s, float tx, float ty, const Steadiness *st)
-{
-    double now = (double)CFAbsoluteTimeGetCurrent();
-    float  dt  = s->last_t > 0 ? (float)(now - s->last_t) : 1.0f / 30.0f;
-    dt = std::max(1.0f / 240.0f, std::min(0.25f, dt));   /* guard odd gaps */
-    s->last_t = now;
-
-    s->cur_x = euro_step(&s->fx, tx, dt, st);
-    s->cur_y = euro_step(&s->fy, ty, dt, st);
-    s->have_cursor = true;
-}
-
-/* Restart the filter at a position (no smoothing "catch-up" jump). */
+/* Restart the filter at (x, y) — used when a hand (re)appears so the
+ * cursor jumps there instead of gliding from wherever it was. */
 static void smooth_reset(ControllerState *s, float x, float y)
 {
     s->fx = EuroAxis{true, x, 0, x};
     s->fy = EuroAxis{true, y, 0, y};
     s->cur_x = x; s->cur_y = y;
+    s->have_cursor = true;
+    s->hist_n = 0;
 }
+
+static void smooth_to(ControllerState *s, float tx, float ty, const Steadiness *st)
+{
+    double now = controller_now();
+    float  dt  = s->last_t > 0 ? (float)(now - s->last_t) : 1.0f / 30.0f;
+    dt = std::max(1.0f / 240.0f, std::min(0.25f, dt));
+    s->last_t = now;
+
+    if (!s->have_cursor) { smooth_reset(s, tx, ty); return; }
+    s->cur_x = euro_step(&s->fx, tx, dt, st);
+    s->cur_y = euro_step(&s->fy, ty, dt, st);
+}
+
+/* =========================================================================
+ * SECTION 3 — CURSOR HISTORY (to undo the fist-closing drift)
+ * ========================================================================= */
 
 static void history_push(ControllerState *s)
 {
@@ -141,7 +90,6 @@ static void history_push(ControllerState *s)
     if (s->hist_n < CTRL_HISTORY) ++s->hist_n;
 }
 
-/* Cursor position from `back` frames ago (clamped to what we have). */
 static void history_get(const ControllerState *s, int back, float *x, float *y)
 {
     back = std::min(back, s->hist_n);
@@ -151,38 +99,49 @@ static void history_get(const ControllerState *s, int back, float *x, float *y)
 }
 
 /* =========================================================================
- * SECTION 4 — GRAB START / END
+ * SECTION 4 — HELPERS
  * ========================================================================= */
 
-static void grab_start(ControllerState *s, const HandResult *h)
+static float map01(float v, float lo, float hi)
 {
-    /* 1. Undo the downward drift caused by curling the fingers. */
-    float rx, ry;
-    history_get(s, CTRL_REWIND, &rx, &ry);
-    smooth_reset(s, rx, ry);
-    mouse_move(s->cur_x, s->cur_y);
+    return std::max(0.0f, std::min(1.0f, (v - lo) / (hi - lo)));
+}
 
-    /* 2. Find and remember the window under the cursor. */
-    s->window = (void *)window_at(s->cur_x, s->cur_y);
-    if (s->window && !window_get_pos((AXUIElementRef)s->window, &s->win_x0, &s->win_y0)) {
-        CFRelease((AXUIElementRef)s->window);
-        s->window = NULL;
-    }
-
-    s->grab_cur_x  = s->cur_x;
-    s->grab_cur_y  = s->cur_y;
-    s->grab_palm_x = h->palm_x;
-    s->grab_palm_y = h->palm_y;
-    s->grabbing    = true;
-    printf("[control] GRAB %s\n", s->window ? "window" : "(nothing under cursor)");
+static void move_cursor(ControllerState *s)
+{
+    post_mouse(s->pressed ? kCGEventLeftMouseDragged : kCGEventMouseMoved, s->cur_x, s->cur_y);
+    s->posted = true;
+    s->posted_x = s->cur_x;
+    s->posted_y = s->cur_y;
 }
 
 void controller_release(ControllerState *s)
 {
-    if (s->window) CFRelease((AXUIElementRef)s->window);
-    if (s->grabbing) printf("[control] RELEASE\n");
-    s->window   = NULL;
-    s->grabbing = false;
+    if (s->pressed) {
+        post_mouse(kCGEventLeftMouseUp, s->cur_x, s->cur_y);
+        printf("[control] release\n");
+    }
+    s->pressed = false;
+}
+
+/* Pick which detected hand is the pointer and which the clicker. */
+static void assign_roles(ControllerState *s, const HandsResult *h)
+{
+    s->pointer_idx = s->clicker_idx = -1;
+    if (h->count == 0) return;
+    if (h->count == 1) { s->pointer_idx = 0; return; }
+
+    bool ok0 = h->hand[0].pose == POSE_OK, ok1 = h->hand[1].pose == POSE_OK;
+    int p;
+    if (ok0 != ok1) {
+        p = ok0 ? 1 : 0;                                  /* OK hand clicks */
+    } else if (s->ptr_known && h->hand[0].is_right != h->hand[1].is_right) {
+        p = (h->hand[0].is_right == s->ptr_is_right) ? 0 : 1;  /* keep same */
+    } else {
+        p = h->hand[1].is_right && !h->hand[0].is_right ? 1 : 0; /* prefer right */
+    }
+    s->pointer_idx = p;
+    s->clicker_idx = 1 - p;
 }
 
 /* =========================================================================
@@ -192,78 +151,121 @@ void controller_release(ControllerState *s)
 bool controller_init(ControllerState *s)
 {
     *s = {};
-    s->stable_pose = POSE_POINT;
+    s->ptr_stable  = POSE_POINT;
+    s->pointer_idx = s->clicker_idx = -1;
 
-    /* AXIsProcessTrustedWithOptions with the prompt flag pops up the
-     * macOS dialog that links straight to the Accessibility settings. */
     const void *keys[] = { kAXTrustedCheckOptionPrompt };
     const void *vals[] = { kCFBooleanTrue };
     CFDictionaryRef opts = CFDictionaryCreate(NULL, keys, vals, 1,
         &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
     bool trusted = AXIsProcessTrustedWithOptions(opts);
     CFRelease(opts);
-
     if (!trusted)
         fprintf(stderr,
-            "[control] Accessibility permission missing — cursor/windows won't move.\n"
+            "[control] Accessibility permission missing — the cursor won't move.\n"
             "          System Settings > Privacy & Security > Accessibility >\n"
             "          enable your terminal app, then restart this program.\n");
     return trusted;
 }
 
-void controller_update(ControllerState *s, const HandResult *h,
+void controller_update(ControllerState *s, const HandsResult *h,
                        const Calibration *cal, int scr_w, int scr_h)
 {
-    const ActiveBox  *box = &cal->box;
-    const Steadiness *st  = &cal->steady;
+    const double now = controller_now();
 
-    /* --- No hand: hold still; drop the window if it stays gone --- */
-    if (!h->hand_detected) {
+    /* ---- 1. Trackpad takeover ----
+     * If the cursor isn't where we left it, someone else moved it. */
+    if (s->posted) {
+        CGPoint p = cursor_now();
+        if (std::hypot(p.x - s->posted_x, p.y - s->posted_y) > CFG_TRACKPAD_PX) {
+            s->cur_x = (float)p.x; s->cur_y = (float)p.y;
+            controller_release(s);
+            s->pause_until = now + CFG_TRACKPAD_PAUSE;
+            s->have_cursor = false;
+            printf("[control] trackpad used — camera paused %.1fs\n", CFG_TRACKPAD_PAUSE);
+        }
+    }
+    s->posted = false;
+    s->paused = now < s->pause_until;
+
+    assign_roles(s, h);
+
+    /* ---- 2. No hands: hands-off, trackpad works ---- */
+    if (h->count == 0) {
+        s->ok_n = 0;
         if (++s->lost_n >= CFG_LOST_FRAMES) {
-            if (s->grabbing) controller_release(s);
-            s->last_t = 0;   /* hand gone: don't let the gap skew the filter */
+            controller_release(s);
+            s->have_cursor = false;    /* next sighting jumps, no glide */
         }
         return;
     }
     s->lost_n = 0;
 
-    /* --- Debounce the pose --- */
-    if (h->pose == s->candidate) ++s->candidate_n;
-    else { s->candidate = h->pose; s->candidate_n = 1; }
-    if (s->candidate_n >= CFG_POSE_FRAMES) s->stable_pose = s->candidate;
+    if (s->paused) { s->have_cursor = false; return; }
 
-    /* Pixels of screen per unit of normalised camera movement. */
-    float sx = scr_w / (box->x1 - box->x0);
-    float sy = scr_h / (box->y1 - box->y0);
+    /* ---- 3. Clicker: OK sign → one click ---- */
+    if (s->clicker_idx >= 0 && h->hand[s->clicker_idx].pose == POSE_OK) {
+        if (++s->ok_n == CFG_POSE_FRAMES) {
+            CGPoint c = cursor_now();   /* click where the cursor really is */
+            post_mouse(kCGEventLeftMouseDown, (float)c.x, (float)c.y);
+            post_mouse(kCGEventLeftMouseUp,   (float)c.x, (float)c.y);
+            s->click_flash_until = now + 0.4;
+            printf("[control] click\n");
+        }
+    } else {
+        s->ok_n = 0;
+    }
 
-    /* ================= POINTER ================= */
-    if (s->stable_pose == POSE_POINT) {
-        if (s->grabbing) controller_release(s);
+    /* ---- 4. Pointer ---- */
+    const HandInfo &p = h->hand[s->pointer_idx];
 
-        /* While a fist is forming (raw FIST, not yet confirmed) freeze the
-         * cursor so the curling fingers don't drag it downward. */
-        if (h->pose != POSE_POINT) return;
+    /* Switched to the other hand? Start the cursor fresh from it. */
+    if (s->ptr_known && p.is_right != s->ptr_is_right) {
+        s->have_cursor = false;
+        s->ptr_cand_n  = 0;
+    }
+    s->ptr_known    = true;
+    s->ptr_is_right = p.is_right;
 
-        float tx = map01(h->tip_x, box->x0, box->x1) * (scr_w - 1);
-        float ty = map01(h->tip_y, box->y0, box->y1) * (scr_h - 1);
-        smooth_to(s, tx, ty, st);
+    /* Debounce: only POINT and FIST change what the pointer does. */
+    if (p.pose == s->ptr_cand) ++s->ptr_cand_n;
+    else { s->ptr_cand = p.pose; s->ptr_cand_n = 1; }
+    if (s->ptr_cand_n >= CFG_POSE_FRAMES &&
+        (s->ptr_cand == POSE_POINT || s->ptr_cand == POSE_FIST))
+        s->ptr_stable = s->ptr_cand;
+
+    const ActiveBox &box = cal->box;
+
+    if (s->ptr_stable == POSE_POINT) {
+        controller_release(s);
+        /* While the hand is changing shape (not a clean POINT), hold the
+         * cursor still so curling fingers don't drag it. */
+        if (p.pose != POSE_POINT) return;
+        float tx = map01(p.tip_x, box.x0, box.x1) * (scr_w - 1);
+        float ty = map01(p.tip_y, box.y0, box.y1) * (scr_h - 1);
+        smooth_to(s, tx, ty, &cal->steady);
         history_push(s);
-        mouse_move(s->cur_x, s->cur_y);
+        move_cursor(s);
         return;
     }
 
-    /* ================= GRAB ================= */
-    if (!s->grabbing) grab_start(s, h);
-
-    float tx = s->grab_cur_x + (h->palm_x - s->grab_palm_x) * sx;
-    float ty = s->grab_cur_y + (h->palm_y - s->grab_palm_y) * sy;
-    tx = std::max(0.0f, std::min((float)scr_w - 1, tx));
-    ty = std::max(0.0f, std::min((float)scr_h - 1, ty));
-    smooth_to(s, tx, ty, st);
-    mouse_move(s->cur_x, s->cur_y);
-
-    if (s->window)
-        window_set_pos((AXUIElementRef)s->window,
-                       s->win_x0 + (s->cur_x - s->grab_cur_x),
-                       s->win_y0 + (s->cur_y - s->grab_cur_y));
+    /* ptr_stable == POSE_FIST: press and drag. */
+    if (!s->pressed) {
+        float rx, ry;
+        history_get(s, CTRL_REWIND, &rx, &ry);   /* undo closing drift */
+        if (s->have_cursor) smooth_reset(s, rx, ry);
+        else { CGPoint c = cursor_now(); smooth_reset(s, (float)c.x, (float)c.y); }
+        post_mouse(kCGEventLeftMouseDown, s->cur_x, s->cur_y);
+        s->pressed      = true;
+        s->press_cur_x  = s->cur_x;  s->press_cur_y  = s->cur_y;
+        s->press_palm_x = p.palm_x;  s->press_palm_y = p.palm_y;
+        printf("[control] press\n");
+    }
+    /* Follow the palm (the fingertip is hidden in a fist), scaled like
+     * the pointer so a fist moves the cursor as far as a finger would. */
+    float sx = scr_w / (box.x1 - box.x0), sy = scr_h / (box.y1 - box.y0);
+    float tx = std::max(0.0f, std::min((float)scr_w - 1, s->press_cur_x + (p.palm_x - s->press_palm_x) * sx));
+    float ty = std::max(0.0f, std::min((float)scr_h - 1, s->press_cur_y + (p.palm_y - s->press_palm_y) * sy));
+    smooth_to(s, tx, ty, &cal->steady);
+    move_cursor(s);
 }
