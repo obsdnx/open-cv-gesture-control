@@ -1,160 +1,138 @@
 /*
  * main.cpp — program entry point and per-frame loop
  *
- * PROGRAM FLOW (one iteration = one camera frame)
- * ================================================
+ * PROGRAM FLOW
+ * ============
  *
  *   startup
- *     │
- *     ├─ camera_open()       — open webcam, warm up sensor
- *     ├─ controller_init()   — zero the smoothing / drag / scroll state
- *     │
- *     └─ loop ──────────────────────────────────────────────────────────
- *           │
- *           ├─ camera_read(frame)         — grab latest BGR frame
- *           │
- *           ├─ cv::flip(frame)            — mirror so your hand
- *           │                               matches the display
- *           │
- *           ├─ gesture_detect(frame)      — skin mask → contour
- *           │                               → convexity defects
- *           │                               → GestureResult
- *           │
- *           ├─ controller_update(result)  — smoothing → CGEvent
- *           │
- *           └─ (optional) draw HUD and show preview window
+ *     ├─ camera_open()        built-in camera, live frames only
+ *     ├─ gesture_init()       load face detector
+ *     ├─ controller_init()    check Accessibility permission
+ *     └─ calib_load()         no file yet? → start calibration automatically
  *
- *   shutdown
- *     └─ camera_close()
+ *   every frame
+ *     ├─ camera_read()        newest frame (320 wide, real aspect ratio)
+ *     ├─ cv::flip()           mirror, so moving your hand right moves
+ *     │                       the cursor right
+ *     ├─ gesture_detect()     fingertip + palm + POINT/FIST
+ *     ├─ calibrating?  → calib_step()          (mouse is left alone)
+ *     │  otherwise     → controller_update()   (cursor / grab window)
+ *     └─ draw preview         camera image ×2, active box, fingertip, status
  *
- * BUILD
- *   cd c_src && make
+ * KEYS (preview window focused)
+ *   C  recalibrate      D  debug overlay      Q  quit
  *
- * USAGE
- *   ./gesture_control                  (built-in camera, with preview)
- *   ./gesture_control --list           (print cameras and their indices)
- *   ./gesture_control --no-window      (headless)
- *   ./gesture_control --camera 1       (pick a camera from --list)
- *   ./gesture_control --debug          (overlay skin mask / hull)
- *
- * PERMISSIONS REQUIRED (macOS)
- *   Camera      : System Settings → Privacy & Security → Camera → Terminal
- *   Accessibility: System Settings → Privacy & Security → Accessibility → Terminal
+ * BUILD & RUN
+ *   make && ./gesture_control
+ *   ./gesture_control --list        list cameras
+ *   ./gesture_control --camera 1    use another camera
+ *   ./gesture_control --calibrate   force calibration at start
  */
 
 #include "camera.h"
 #include "gesture.h"
 #include "controller.h"
+#include "calibration.h"
+#include <opencv2/imgproc.hpp>
+#include <opencv2/highgui.hpp>
 #include <CoreGraphics/CoreGraphics.h>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 
 /* =========================================================================
- * SECTION 1 — HUD DRAWING
+ * SECTION 1 — PREVIEW DRAWING
  *
- * A minimal "heads-up display" drawn onto the preview frame with OpenCV.
- * This is separate from gesture logic — removing it has no effect on
- * how the controller behaves.
+ * The preview is the processing frame scaled up by CFG_PREVIEW_SCALE.
+ * Everything is drawn in preview pixels; P() converts a normalised (0–1)
+ * position into those pixels.
  * ========================================================================= */
 
-/* Gesture name strings for the status bar */
-static const char *GESTURE_NAMES[] = {
-    "IDLE",
-    "POINTER  — cursor mode",
-    "DRAG     — hold & drag",
-    "SCROLL   — scroll wheel",
-    "SWITCH   — Cmd+Tab",
-    "MINIMIZE — Cmd+M",
-    "MAXIMIZE — Cmd+Ctrl+F",
-};
-
-static const cv::Scalar GESTURE_COLORS[] = {
-    cv::Scalar(128, 128, 128),   /* NONE    — grey                         */
-    cv::Scalar(100, 255, 100),   /* POINTER — green                        */
-    cv::Scalar(255, 120,   0),   /* DRAG    — orange                       */
-    cv::Scalar(255, 200,   0),   /* SCROLL  — yellow                       */
-    cv::Scalar(200,   0, 255),   /* SWITCH  — purple                       */
-    cv::Scalar(  0,  80, 255),   /* MINIMIZE— red-blue                     */
-    cv::Scalar(  0, 255, 200),   /* MAXIMIZE— cyan                         */
-};
-
-static const char *LEGEND[] = {
-    "index only  -> POINTER (cursor)",
-    "fist        -> DRAG",
-    "peace (2)   -> SCROLL",
-    "3 fingers   -> SWITCH WINDOW",
-    "4 fingers   -> MINIMIZE",
-    "open hand   -> MAXIMIZE",
-    NULL
-};
-
-static void draw_hud(cv::Mat       &frame,
-                     const GestureResult &result,
-                     double         fps,
-                     bool           show_legend)
+static cv::Point P(const cv::Mat &img, float nx, float ny)
 {
-    int W = frame.cols;
-    int H = frame.rows;
+    return cv::Point((int)(nx * img.cols), (int)(ny * img.rows));
+}
 
-    /* --- Gesture pill at the top --- */
-    int g = (int)result.gesture;
-    cv::Scalar col = GESTURE_COLORS[g];
+static void draw_preview(cv::Mat &img, const HandResult &h, const ControllerState &c,
+                         const ActiveBox &box, bool calibrating)
+{
+    /* Active box: the part of the camera view that maps to your screen. */
+    cv::rectangle(img, P(img, box.x0, box.y0), P(img, box.x1, box.y1),
+                  cv::Scalar(255, 180, 0), 2);
+    cv::putText(img, "screen area", P(img, box.x0, box.y0) + cv::Point(4, -6),
+                cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 180, 0), 1);
 
-    cv::rectangle(frame, cv::Point(10, 10), cv::Point(W-10, 48),
-                  cv::Scalar(0,0,0), -1);
-    cv::rectangle(frame, cv::Point(10, 10), cv::Point(W-10, 48), col, 2);
-    cv::putText(frame, GESTURE_NAMES[g],
-                cv::Point(18, 36),
-                cv::FONT_HERSHEY_SIMPLEX, 0.65, col, 2);
+    if (calibrating) return;   /* calibration draws its own banner */
 
-    /* --- FPS counter (bottom-right) --- */
-    char fps_buf[32];
-    snprintf(fps_buf, sizeof(fps_buf), "FPS %.0f", fps);
-    cv::putText(frame, fps_buf,
-                cv::Point(W - 90, H - 10),
-                cv::FONT_HERSHEY_SIMPLEX, 0.5,
-                cv::Scalar(180,180,180), 1);
+    /* Status pill */
+    const char *label; cv::Scalar col;
+    if (!h.hand_detected)            { label = "NO HAND";  col = cv::Scalar(140, 140, 140); }
+    else if (c.grabbing)             { label = c.window ? "GRAB - moving window" : "GRAB - no window here";
+                                       col = cv::Scalar(0, 140, 255); }
+    else                             { label = "POINTER";  col = cv::Scalar(80, 230, 80); }
 
-    /* --- Hand indicator dot --- */
-    if (result.hand_detected) {
-        int dot_x = (int)(result.norm_x * W);
-        int dot_y = (int)(result.norm_y * H);
-        cv::circle(frame, cv::Point(dot_x, dot_y), 8, col, -1);
+    cv::rectangle(img, cv::Point(10, 10), cv::Point(img.cols - 10, 50), cv::Scalar(0, 0, 0), -1);
+    cv::rectangle(img, cv::Point(10, 10), cv::Point(img.cols - 10, 50), col, 2);
+    cv::putText(img, label, cv::Point(22, 38), cv::FONT_HERSHEY_SIMPLEX, 0.8, col, 2);
+
+    /* Fingertip (pointer) or palm (grab) marker */
+    if (h.hand_detected) {
+        if (c.grabbing) cv::circle(img, P(img, h.palm_x, h.palm_y), 14, col, 3);
+        else            cv::circle(img, P(img, h.tip_x,  h.tip_y),   9, col, -1);
     }
 
-    /* --- Legend (toggleable with 'L') --- */
-    if (show_legend) {
-        int y = 60;
-        for (int i = 0; LEGEND[i]; ++i) {
-            cv::putText(frame, LEGEND[i],
-                        cv::Point(14, y),
-                        cv::FONT_HERSHEY_SIMPLEX, 0.42,
-                        cv::Scalar(220,220,220), 1);
-            y += 20;
-        }
+    cv::putText(img, "point = move cursor   fist = grab window   C calibrate   D debug   Q quit",
+                cv::Point(12, img.rows - 12), cv::FONT_HERSHEY_SIMPLEX, 0.42,
+                cv::Scalar(220, 220, 220), 1);
+}
+
+/* Debug overlay: hand outline, hull, removed face, solidity, mask inset. */
+static void draw_debug(cv::Mat &img, const GestureDebug &d, const HandResult &h, int scale)
+{
+    auto up = [scale](std::vector<cv::Point> v) {
+        for (cv::Point &p : v) p *= scale;
+        return v;
+    };
+    if (!d.contour.empty()) {
+        std::vector<std::vector<cv::Point>> cs = { up(d.contour), up(d.hull) };
+        cv::drawContours(img, cs, 0, cv::Scalar(0, 255, 0), 2);
+        cv::drawContours(img, cs, 1, cv::Scalar(255, 0, 255), 1);
     }
+    if (d.face.area() > 0)
+        cv::rectangle(img, cv::Rect(d.face.x * scale, d.face.y * scale,
+                                    d.face.width * scale, d.face.height * scale),
+                      cv::Scalar(0, 0, 255), 2);
+
+    char buf[64];
+    snprintf(buf, sizeof buf, "solidity %.2f  (fist > %.2f)", h.solidity, CFG_FIST_SOLIDITY);
+    cv::putText(img, buf, cv::Point(14, 76), cv::FONT_HERSHEY_SIMPLEX, 0.6,
+                cv::Scalar(0, 255, 255), 2);
+
+    /* Skin mask thumbnail, top-right: white = what the program thinks is skin. */
+    cv::Mat thumb;
+    cv::cvtColor(d.mask, thumb, cv::COLOR_GRAY2BGR);
+    cv::Rect where(img.cols - thumb.cols - 10, 60, thumb.cols, thumb.rows);
+    thumb.copyTo(img(where));
+    cv::rectangle(img, where, cv::Scalar(255, 255, 255), 1);
 }
 
 /* =========================================================================
- * SECTION 2 — ARGUMENT PARSING
+ * SECTION 2 — ARGUMENTS
  * ========================================================================= */
 
 struct Args {
-    int  camera     = CAMERA_AUTO;   /* built-in camera unless --camera N */
-    bool no_window  = false;
-    bool debug      = false;
-    bool list       = false;
+    int  camera    = CAMERA_AUTO;
+    bool list      = false;
+    bool calibrate = false;
 };
 
 static Args parse_args(int argc, char **argv)
 {
     Args a;
     for (int i = 1; i < argc; ++i) {
-        if (strcmp(argv[i], "--no-window") == 0) a.no_window = true;
-        if (strcmp(argv[i], "--debug")     == 0) a.debug     = true;
-        if (strcmp(argv[i], "--list")      == 0) a.list      = true;
-        if (strcmp(argv[i], "--camera") == 0 && i+1 < argc)
-            a.camera = atoi(argv[++i]);
+        if (!strcmp(argv[i], "--list"))      a.list = true;
+        if (!strcmp(argv[i], "--calibrate")) a.calibrate = true;
+        if (!strcmp(argv[i], "--camera") && i + 1 < argc) a.camera = atoi(argv[++i]);
     }
     return a;
 }
@@ -166,75 +144,62 @@ static Args parse_args(int argc, char **argv)
 int main(int argc, char **argv)
 {
     Args args = parse_args(argc, argv);
-
     if (args.list) { camera_list(); return 0; }
 
-    /* --- Open camera --- */
     Camera cam = {};
-    if (camera_open(&cam, args.camera, CFG_FRAME_W, CFG_FRAME_H) != 0)
-        return 1;
+    if (camera_open(&cam, args.camera, CFG_FRAME_W) != 0) return 1;
 
-    /* --- Get screen size for the controller ---
-     * CGMainDisplayID() returns the display with the menu bar.
-     * CGDisplayBounds() gives its dimensions in points (=pixels on non-HiDPI).
-     */
+    gesture_init();
+
+    ControllerState ctrl;
+    controller_init(&ctrl);
+
+    /* Screen size in points — the coordinate system CGEvent and AX use. */
     CGRect screen = CGDisplayBounds(CGMainDisplayID());
     int scr_w = (int)screen.size.width;
     int scr_h = (int)screen.size.height;
-    printf("[main] Screen: %d × %d\n", scr_w, scr_h);
+    printf("[main] Screen %d x %d\n", scr_w, scr_h);
 
-    /* --- Initialise controller state --- */
-    ControllerState ctrl = {};
-    controller_init(&ctrl);
+    Calibration cal = calib_default();
+    CalSession  cs  = {};
+    bool have_file  = calib_load(&cal);
+    if (!have_file || args.calibrate) calib_start(&cs);
+    else printf("[main] Loaded calibration. Press C in the preview to redo it.\n");
 
-    printf("[main] Running. Press Q in preview to quit.\n");
+    const char *WIN = "Gesture Control";
+    cv::namedWindow(WIN, cv::WINDOW_AUTOSIZE);   /* never stretch the image */
 
-    /* --- FPS measurement --- */
-    double   fps       = 0;
-    int64_t  tick_prev = cv::getTickCount();
-    bool     show_legend = true;
-
-    cv::Mat frame;
+    bool debug = false;
+    cv::Mat frame, preview;
+    GestureDebug dbg;
 
     while (true) {
-
-        /* 1. Grab frame */
         if (!camera_read(&cam, &frame)) continue;
+        cv::flip(frame, frame, 1);                       /* mirror */
 
-        /* 2. Mirror: flip horizontally so your right hand appears on the
-         *    right side of the preview (webcams default to a mirror image). */
-        cv::flip(frame, frame, 1);
+        HandResult hand = gesture_detect(frame, cal.skin, debug ? &dbg : nullptr);
 
-        /* 3. Detect gesture */
-        GestureResult result = gesture_detect(frame);
+        bool calibrating = calib_step(&cs, frame, hand, &cal);
+        if (!calibrating)
+            controller_update(&ctrl, &hand, &cal.box, scr_w, scr_h);
 
-        /* 4. Execute macOS input */
-        controller_update(&ctrl, &result, scr_w, scr_h);
+        /* --- preview --- */
+        cv::resize(frame, preview, cv::Size(), CFG_PREVIEW_SCALE, CFG_PREVIEW_SCALE,
+                   cv::INTER_LINEAR);
+        if (debug) draw_debug(preview, dbg, hand, CFG_PREVIEW_SCALE);
+        draw_preview(preview, hand, ctrl, cal.box, calibrating);
+        calib_draw(&cs, preview, CFG_PREVIEW_SCALE);
+        cv::imshow(WIN, preview);
 
-        /* 5. FPS calculation
-         *    cv::getTickCount() and cv::getTickFrequency() are monotonic
-         *    high-resolution timers — faster than clock() on macOS.     */
-        int64_t tick_now = cv::getTickCount();
-        fps = cv::getTickFrequency() / (double)(tick_now - tick_prev);
-        tick_prev = tick_now;
-
-        /* 6. Preview window */
-        if (!args.no_window) {
-            if (args.debug)
-                gesture_draw_debug(frame, result);
-
-            draw_hud(frame, result, fps, show_legend);
-            cv::imshow("Gesture Control", frame);
-
-            int key = cv::waitKey(1) & 0xFF;
-            if (key == 'q' || key == 'Q') break;
-            if (key == 'l' || key == 'L') show_legend = !show_legend;
-            if (key == 'd' || key == 'D') args.debug  = !args.debug;
-        }
+        int key = cv::waitKey(1) & 0xFF;
+        if (key == 'q' || key == 'Q') break;
+        if (key == 'd' || key == 'D') debug = !debug;
+        if (key == 'c' || key == 'C') { controller_release(&ctrl); calib_start(&cs); }
     }
 
+    controller_release(&ctrl);
     camera_close(&cam);
-    if (!args.no_window) cv::destroyAllWindows();
+    cv::destroyAllWindows();
     printf("[main] Stopped.\n");
     return 0;
 }

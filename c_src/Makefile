@@ -33,7 +33,11 @@ OPENCV_LIBS   := -L$(OPENCV_PREFIX)/lib \
                  -lopencv_core     \
                  -lopencv_imgproc  \
                  -lopencv_geometry \
+                 -lopencv_xobjdetect \
                  -lopencv_highgui
+
+# Haar face detector shipped with OpenCV (used to ignore your face)
+FACE_CASCADE  := $(OPENCV_PREFIX)/share/opencv5/haarcascades/haarcascade_frontalface_default.xml
 
 # ---------------------------------------------------------------------------
 # macOS system frameworks
@@ -56,13 +60,14 @@ MAC_FRAMEWORKS := -framework AVFoundation         \
 # ---------------------------------------------------------------------------
 # Include paths: our own headers + OpenCV
 # ---------------------------------------------------------------------------
-INCLUDES := -I include -I $(OPENCV_INC)
+INCLUDES := -I include -I $(OPENCV_INC) -DFACE_CASCADE='"$(FACE_CASCADE)"'
 
 # ---------------------------------------------------------------------------
 # Source files and derived object paths
 # ---------------------------------------------------------------------------
-SRCS := src/main.cpp       \
-        src/gesture.cpp    \
+SRCS := src/main.cpp        \
+        src/gesture.cpp     \
+        src/calibration.cpp \
         src/controller.cpp
 
 # camera.mm is Objective-C++ (AVFoundation), built with its own rule below
