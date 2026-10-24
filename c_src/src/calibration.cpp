@@ -11,14 +11,22 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <vector>
 
 static const double SKIN_SECONDS  = 3.0;
-static const double REACH_SECONDS = 6.0;
+static const double REACH_SECONDS = 8.0;
 
 /* The reach box must span at least this fraction of the frame on each
  * axis, otherwise the cursor would be far too sensitive — we keep the
  * previous box instead. */
 static const float MIN_SPAN = 0.15f;
+
+/* Value at fraction q (0–1) of the sorted samples. */
+static float percentile(std::vector<float> v, float q)
+{
+    std::sort(v.begin(), v.end());
+    return v[(size_t)(q * (v.size() - 1))];
+}
 
 static double now_s(void)
 {
@@ -37,6 +45,7 @@ static std::string calib_path(void)
  * File format (plain text, easy to inspect or hand-edit):
  *   skin <h_lo> <h_hi> <s_lo> <s_hi> <v_lo> <v_hi>
  *   box  <x0> <y0> <x1> <y1>
+ *   filter <min_cutoff> <beta>      (optional; older files lack it)
  * ========================================================================= */
 
 Calibration calib_default(void)
@@ -46,6 +55,7 @@ Calibration calib_default(void)
     /* Fingertip rarely reaches the bottom of the frame (your hand would be
      * out of view), so the default box sits in the upper-middle region. */
     c.box  = ActiveBox{0.20f, 0.10f, 0.80f, 0.65f};
+    c.steady = Steadiness{CFG_EURO_MIN_CUTOFF, CFG_EURO_BETA};
     return c;
 }
 
@@ -53,11 +63,13 @@ bool calib_load(Calibration *cal)
 {
     FILE *f = fopen(calib_path().c_str(), "r");
     if (!f) return false;
-    Calibration c;
+    Calibration c = calib_default();
     int ok = fscanf(f, "skin %d %d %d %d %d %d\nbox %f %f %f %f",
                     &c.skin.h_lo, &c.skin.h_hi, &c.skin.s_lo, &c.skin.s_hi,
                     &c.skin.v_lo, &c.skin.v_hi,
                     &c.box.x0, &c.box.y0, &c.box.x1, &c.box.y1);
+    if (ok == 10)
+        fscanf(f, " filter %f %f", &c.steady.min_cutoff, &c.steady.beta);
     fclose(f);
     if (ok != 10) return false;
     *cal = c;
@@ -68,10 +80,11 @@ void calib_save(const Calibration *c)
 {
     FILE *f = fopen(calib_path().c_str(), "w");
     if (!f) { fprintf(stderr, "[calib] Cannot write %s\n", calib_path().c_str()); return; }
-    fprintf(f, "skin %d %d %d %d %d %d\nbox %.4f %.4f %.4f %.4f\n",
+    fprintf(f, "skin %d %d %d %d %d %d\nbox %.4f %.4f %.4f %.4f\nfilter %.4f %.5f\n",
             c->skin.h_lo, c->skin.h_hi, c->skin.s_lo, c->skin.s_hi,
             c->skin.v_lo, c->skin.v_hi,
-            c->box.x0, c->box.y0, c->box.x1, c->box.y1);
+            c->box.x0, c->box.y0, c->box.x1, c->box.y1,
+            c->steady.min_cutoff, c->steady.beta);
     fclose(f);
     printf("[calib] Saved to %s\n", calib_path().c_str());
 }
@@ -111,12 +124,16 @@ bool calib_step(CalSession *s, const cv::Mat &frame,
             s->min_x = s->min_y =  1.0f;
             s->max_x = s->max_y =  0.0f;
             s->samples = 0;
+            s->xs.clear(); s->ys.clear();
         }
         return true;
     }
 
-    /* CAL_REACH: track the extremes of the fingertip while pointing. */
-    if (hand.hand_detected && hand.pose == POSE_POINT) {
+    /* CAL_REACH: record every fingertip position (any pose — if the fist
+     * threshold misjudges your pointing hand we still want the samples). */
+    if (hand.hand_detected) {
+        s->xs.push_back(hand.tip_x);
+        s->ys.push_back(hand.tip_y);
         s->min_x = std::min(s->min_x, hand.tip_x);
         s->max_x = std::max(s->max_x, hand.tip_x);
         s->min_y = std::min(s->min_y, hand.tip_y);
@@ -125,14 +142,22 @@ bool calib_step(CalSession *s, const cv::Mat &frame,
     }
 
     if (t >= REACH_SECONDS) {
-        if (s->samples > 10 &&
-            s->max_x - s->min_x >= MIN_SPAN &&
-            s->max_y - s->min_y >= MIN_SPAN) {
-            cal->box = ActiveBox{s->min_x, s->min_y, s->max_x, s->max_y};
-            printf("[calib] Reach box: x %.2f–%.2f, y %.2f–%.2f\n",
-                   s->min_x, s->max_x, s->min_y, s->max_y);
+        if (s->samples < 30) {
+            printf("[calib] Hand only seen in %d frames — kept previous box.\n"
+                   "        Check the debug view (D): your hand should be white in the mask.\n",
+                   s->samples);
         } else {
-            printf("[calib] Reach too small or hand not seen — kept previous box. Press C to retry.\n");
+            ActiveBox b = { percentile(s->xs, 0.03f), percentile(s->ys, 0.03f),
+                            percentile(s->xs, 0.97f), percentile(s->ys, 0.97f) };
+            if (b.x1 - b.x0 >= MIN_SPAN && b.y1 - b.y0 >= MIN_SPAN) {
+                cal->box = b;
+                printf("[calib] Reach box: x %.2f-%.2f, y %.2f-%.2f (%d samples)\n",
+                       b.x0, b.x1, b.y0, b.y1, s->samples);
+            } else {
+                printf("[calib] Reach too small (%.2f x %.2f, need %.2f) — kept previous box.\n"
+                       "        Move your whole arm to the corners and press C to retry.\n",
+                       b.x1 - b.x0, b.y1 - b.y0, MIN_SPAN);
+            }
         }
         calib_save(cal);
         s->phase = CAL_OFF;
@@ -175,6 +200,6 @@ void calib_draw(const CalSession *s, cv::Mat &preview, int scale)
                 cv::Point((int)(s->max_x * preview.cols), (int)(s->max_y * preview.rows)),
                 cv::Scalar(0, 255, 255), 2);
         snprintf(buf, sizeof buf, "STEP 2/2  -  %.0f", REACH_SECONDS - t + 0.5);
-        banner(preview, buf, "Point one finger and touch all 4 corners of your reach");
+        banner(preview, buf, "Point one finger and trace a BIG rectangle - all 4 corners");
     }
 }

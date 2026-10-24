@@ -6,11 +6,15 @@
  *   fills the box. When the countdown ends we sample the colour inside it.
  *   This makes hand detection work for YOUR skin under YOUR lighting.
  *
- * STEP 2 — REACH (6 seconds)
- *   Point with one finger and touch all four corners of the area you can
- *   comfortably reach. We record the left/right/top/bottom extremes of
- *   your fingertip. Those extremes become the ActiveBox, so:
+ * STEP 2 — REACH (8 seconds)
+ *   Point with one finger and trace a big rectangle — all four corners of
+ *   the area you can comfortably reach. Every fingertip position is
+ *   recorded. The box is set from the 3rd–97th percentile of those
+ *   positions, so a few glitchy frames can't stretch it. Then:
  *     fingertip at your top-right extreme → cursor at screen top-right.
+ *
+ *   BIGGER REACH = STEADIER CURSOR. The box is stretched over the whole
+ *   screen, so a small box magnifies every tremor. Use wide arm moves.
  *
  * The result is saved to ~/.gesture_control_calibration and loaded on
  * every start. If the file doesn't exist, calibration starts by itself.
@@ -18,6 +22,7 @@
 
 #pragma once
 #include <opencv2/core.hpp>
+#include <vector>
 #include "types.h"
 
 typedef enum {
@@ -29,9 +34,10 @@ typedef enum {
 typedef struct {
     CalPhase phase;
     double   phase_start;         /* seconds (cv::getTickCount based)   */
-    float    min_x, min_y;        /* fingertip extremes seen in REACH   */
+    float    min_x, min_y;        /* live extremes (for on-screen box)  */
     float    max_x, max_y;
     int      samples;
+    std::vector<float> xs, ys;    /* every fingertip sample in REACH    */
 } CalSession;
 
 /* Defaults used before the first calibration. */

@@ -21,6 +21,8 @@
  *
  * KEYS (preview window focused)
  *   C  recalibrate      D  debug overlay      Q  quit
+ *   ]  steadier (less shake, a little more lag)
+ *   [  snappier (less lag, a little more shake)
  *
  * BUILD & RUN
  *   make && ./gesture_control
@@ -39,6 +41,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <algorithm>
 
 /* =========================================================================
  * SECTION 1 — PREVIEW DRAWING
@@ -54,15 +57,20 @@ static cv::Point P(const cv::Mat &img, float nx, float ny)
 }
 
 static void draw_preview(cv::Mat &img, const HandResult &h, const ControllerState &c,
-                         const ActiveBox &box, bool calibrating)
+                         const Calibration &cal, bool calibrating)
 {
+    const ActiveBox &box = cal.box;
     /* Active box: the part of the camera view that maps to your screen. */
     cv::rectangle(img, P(img, box.x0, box.y0), P(img, box.x1, box.y1),
                   cv::Scalar(255, 180, 0), 2);
     cv::putText(img, "screen area", P(img, box.x0, box.y0) + cv::Point(4, -6),
                 cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 180, 0), 1);
 
-    if (calibrating) return;   /* calibration draws its own banner */
+    if (calibrating) {        /* calibration draws its own banner */
+        if (h.hand_detected)
+            cv::circle(img, P(img, h.tip_x, h.tip_y), 8, cv::Scalar(0, 255, 255), -1);
+        return;
+    }
 
     /* Status pill */
     const char *label; cv::Scalar col;
@@ -80,6 +88,12 @@ static void draw_preview(cv::Mat &img, const HandResult &h, const ControllerStat
         if (c.grabbing) cv::circle(img, P(img, h.palm_x, h.palm_y), 14, col, 3);
         else            cv::circle(img, P(img, h.tip_x,  h.tip_y),   9, col, -1);
     }
+
+    char steady[64];
+    snprintf(steady, sizeof steady, "steadiness %.2f   [ snappier   ] steadier",
+             1.0f / cal.steady.min_cutoff);
+    cv::putText(img, steady, cv::Point(12, img.rows - 34), cv::FONT_HERSHEY_SIMPLEX, 0.5,
+                cv::Scalar(255, 180, 0), 1);
 
     cv::putText(img, "point = move cursor   fist = grab window   C calibrate   D debug   Q quit",
                 cv::Point(12, img.rows - 12), cv::FONT_HERSHEY_SIMPLEX, 0.42,
@@ -181,13 +195,13 @@ int main(int argc, char **argv)
 
         bool calibrating = calib_step(&cs, frame, hand, &cal);
         if (!calibrating)
-            controller_update(&ctrl, &hand, &cal.box, scr_w, scr_h);
+            controller_update(&ctrl, &hand, &cal, scr_w, scr_h);
 
         /* --- preview --- */
         cv::resize(frame, preview, cv::Size(), CFG_PREVIEW_SCALE, CFG_PREVIEW_SCALE,
                    cv::INTER_LINEAR);
         if (debug) draw_debug(preview, dbg, hand, CFG_PREVIEW_SCALE);
-        draw_preview(preview, hand, ctrl, cal.box, calibrating);
+        draw_preview(preview, hand, ctrl, cal, calibrating);
         calib_draw(&cs, preview, CFG_PREVIEW_SCALE);
         cv::imshow(WIN, preview);
 
@@ -195,6 +209,15 @@ int main(int argc, char **argv)
         if (key == 'q' || key == 'Q') break;
         if (key == 'd' || key == 'D') debug = !debug;
         if (key == 'c' || key == 'C') { controller_release(&ctrl); calib_start(&cs); }
+
+        /* Steadiness: lower min_cutoff = heavier smoothing when still.
+         * Each press changes it by 25%; saved so it sticks next launch. */
+        if (key == ']' || key == '[') {
+            float f = (key == ']') ? 1.0f / 1.25f : 1.25f;
+            cal.steady.min_cutoff = std::max(0.05f, std::min(5.0f, cal.steady.min_cutoff * f));
+            printf("[main] steadiness %.2f\n", 1.0f / cal.steady.min_cutoff);
+            calib_save(&cal);
+        }
     }
 
     controller_release(&ctrl);

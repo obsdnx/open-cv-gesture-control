@@ -12,9 +12,20 @@
  *   Clamped to the screen edges, so pointing past your calibrated reach
  *   pins the cursor to the edge/corner.
  *
- *   Smoothing is ADAPTIVE: a tiny movement (hand tremor) moves the cursor
- *   only 15% of the way per frame; a big fast movement moves it ~100%.
- *   You get a steady cursor without lag on large moves.
+ *   SMOOTHING — the One Euro filter (Casiez et al., 2012)
+ *   ----------------------------------------------------
+ *   A low-pass filter removes jitter, but a fixed one either shakes
+ *   (too little) or lags (too much). The One Euro filter changes its
+ *   strength with speed:
+ *
+ *     cutoff = min_cutoff + beta × |speed|
+ *     alpha  = 1 / (1 + 1 / (2π × cutoff × dt))
+ *     out    = out + alpha × (in − out)
+ *
+ *   Hand still  → speed ≈ 0 → cutoff = min_cutoff (low) → heavy smoothing
+ *   Hand moving → speed big → cutoff high          → almost no smoothing
+ *
+ *   min_cutoff is your "steadiness" knob: [ and ] in the preview.
  *
  * GRAB (fist)
  * ===========
@@ -49,9 +60,19 @@
 #define CTRL_HISTORY 8     /* cursor positions remembered (ring buffer) */
 #define CTRL_REWIND  4     /* frames to rewind when a fist starts       */
 
+/* State of a One Euro filter for ONE axis. */
+typedef struct {
+    bool  init;
+    float x;      /* filtered value          */
+    float dx;     /* filtered speed (px/s)   */
+    float raw;    /* previous raw input      */
+} EuroAxis;
+
 typedef struct {
     /* cursor */
     float cur_x, cur_y;            /* smoothed cursor, screen pixels        */
+    EuroAxis fx, fy;               /* One Euro filter state per axis        */
+    double   last_t;               /* time of previous update (seconds)     */
     bool  have_cursor;             /* false until the first hand is seen    */
     float hist_x[CTRL_HISTORY];    /* recent cursor positions               */
     float hist_y[CTRL_HISTORY];
@@ -76,9 +97,9 @@ typedef struct {
  * opens the macOS prompt. Returns false if permission is not granted yet. */
 bool controller_init(ControllerState *s);
 
-/* Process one frame. `box` is the calibrated ActiveBox. */
+/* Process one frame using the calibrated reach box and steadiness. */
 void controller_update(ControllerState *s, const HandResult *hand,
-                       const ActiveBox *box, int scr_w, int scr_h);
+                       const Calibration *cal, int scr_w, int scr_h);
 
 /* Drop any grabbed window (call on exit or when calibration starts). */
 void controller_release(ControllerState *s);

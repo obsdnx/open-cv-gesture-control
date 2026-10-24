@@ -89,20 +89,48 @@ static float map01(float v, float lo, float hi)
     return std::max(0.0f, std::min(1.0f, t));
 }
 
-/* Adaptive exponential smoothing toward (tx, ty). */
-static void smooth_to(ControllerState *s, float tx, float ty)
+/* Smoothing factor for a first-order low-pass at `cutoff` Hz. */
+static float euro_alpha(float cutoff, float dt)
 {
-    if (!s->have_cursor) {            /* first sighting: jump straight there */
-        s->cur_x = tx; s->cur_y = ty; s->have_cursor = true;
-        return;
-    }
-    float dx = tx - s->cur_x, dy = ty - s->cur_y;
-    float d  = std::sqrt(dx * dx + dy * dy);
-    if (d < CFG_DEADZONE_PX) return;  /* ignore tremor */
+    float tau = 1.0f / (2.0f * (float)M_PI * cutoff);
+    return 1.0f / (1.0f + tau / dt);
+}
 
-    float a = CFG_SMOOTH_MIN + (1.0f - CFG_SMOOTH_MIN) * std::min(1.0f, d / CFG_SMOOTH_FAST_PX);
-    s->cur_x += a * dx;
-    s->cur_y += a * dy;
+/* One Euro filter step for one axis. See controller.h for the idea. */
+static float euro_step(EuroAxis *a, float raw, float dt, const Steadiness *st)
+{
+    if (!a->init) { a->init = true; a->x = a->raw = raw; a->dx = 0; return raw; }
+
+    /* 1. Estimate speed, smoothed with a fixed cutoff. */
+    float speed = (raw - a->raw) / dt;
+    a->dx  += euro_alpha(CFG_EURO_D_CUTOFF, dt) * (speed - a->dx);
+    a->raw  = raw;
+
+    /* 2. Faster movement → higher cutoff → less smoothing. */
+    float cutoff = st->min_cutoff + st->beta * std::fabs(a->dx);
+    a->x += euro_alpha(cutoff, dt) * (raw - a->x);
+    return a->x;
+}
+
+/* Filter (tx, ty) into the cursor position. */
+static void smooth_to(ControllerState *s, float tx, float ty, const Steadiness *st)
+{
+    double now = (double)CFAbsoluteTimeGetCurrent();
+    float  dt  = s->last_t > 0 ? (float)(now - s->last_t) : 1.0f / 30.0f;
+    dt = std::max(1.0f / 240.0f, std::min(0.25f, dt));   /* guard odd gaps */
+    s->last_t = now;
+
+    s->cur_x = euro_step(&s->fx, tx, dt, st);
+    s->cur_y = euro_step(&s->fy, ty, dt, st);
+    s->have_cursor = true;
+}
+
+/* Restart the filter at a position (no smoothing "catch-up" jump). */
+static void smooth_reset(ControllerState *s, float x, float y)
+{
+    s->fx = EuroAxis{true, x, 0, x};
+    s->fy = EuroAxis{true, y, 0, y};
+    s->cur_x = x; s->cur_y = y;
 }
 
 static void history_push(ControllerState *s)
@@ -129,7 +157,9 @@ static void history_get(const ControllerState *s, int back, float *x, float *y)
 static void grab_start(ControllerState *s, const HandResult *h)
 {
     /* 1. Undo the downward drift caused by curling the fingers. */
-    history_get(s, CTRL_REWIND, &s->cur_x, &s->cur_y);
+    float rx, ry;
+    history_get(s, CTRL_REWIND, &rx, &ry);
+    smooth_reset(s, rx, ry);
     mouse_move(s->cur_x, s->cur_y);
 
     /* 2. Find and remember the window under the cursor. */
@@ -182,12 +212,17 @@ bool controller_init(ControllerState *s)
 }
 
 void controller_update(ControllerState *s, const HandResult *h,
-                       const ActiveBox *box, int scr_w, int scr_h)
+                       const Calibration *cal, int scr_w, int scr_h)
 {
+    const ActiveBox  *box = &cal->box;
+    const Steadiness *st  = &cal->steady;
+
     /* --- No hand: hold still; drop the window if it stays gone --- */
     if (!h->hand_detected) {
-        if (++s->lost_n >= CFG_LOST_FRAMES && s->grabbing)
-            controller_release(s);
+        if (++s->lost_n >= CFG_LOST_FRAMES) {
+            if (s->grabbing) controller_release(s);
+            s->last_t = 0;   /* hand gone: don't let the gap skew the filter */
+        }
         return;
     }
     s->lost_n = 0;
@@ -211,7 +246,7 @@ void controller_update(ControllerState *s, const HandResult *h,
 
         float tx = map01(h->tip_x, box->x0, box->x1) * (scr_w - 1);
         float ty = map01(h->tip_y, box->y0, box->y1) * (scr_h - 1);
-        smooth_to(s, tx, ty);
+        smooth_to(s, tx, ty, st);
         history_push(s);
         mouse_move(s->cur_x, s->cur_y);
         return;
@@ -224,7 +259,7 @@ void controller_update(ControllerState *s, const HandResult *h,
     float ty = s->grab_cur_y + (h->palm_y - s->grab_palm_y) * sy;
     tx = std::max(0.0f, std::min((float)scr_w - 1, tx));
     ty = std::max(0.0f, std::min((float)scr_h - 1, ty));
-    smooth_to(s, tx, ty);
+    smooth_to(s, tx, ty, st);
     mouse_move(s->cur_x, s->cur_y);
 
     if (s->window)

@@ -113,22 +113,32 @@ HandResult gesture_detect(const cv::Mat &frame_bgr,
     HandResult r = {};
     const int W = frame_bgr.cols, H = frame_bgr.rows;
 
-    /* --- 1. Skin mask --- */
-    cv::Mat mask;
-    cv::inRange(to_rotated_hsv(frame_bgr),
+    /* --- 1. Skin mask ---
+     * A light blur first: sensor noise makes single pixels flicker in and
+     * out of the skin range, which makes the hand outline (and therefore
+     * the fingertip) jitter. Blurring averages that noise away. */
+    cv::Mat blurred, mask;
+    cv::GaussianBlur(frame_bgr, blurred, cv::Size(5, 5), 0);
+    cv::inRange(to_rotated_hsv(blurred),
                 cv::Scalar(skin.h_lo, skin.s_lo, skin.v_lo),
                 cv::Scalar(skin.h_hi, skin.s_hi, skin.v_hi),
                 mask);
 
     /* --- 2. Remove the face (and neck below it) --- */
     if (g_face_ok && (g_frame_no++ % FACE_EVERY_N) == 0) {
-        cv::Mat gray;
+        /* Face detection runs on a half-size image — faces are big, so
+         * this loses nothing and is 4× faster. Scale the result back up. */
+        cv::Mat gray, small;
         cv::cvtColor(frame_bgr, gray, cv::COLOR_BGR2GRAY);
+        cv::resize(gray, small, cv::Size(), 0.5, 0.5, cv::INTER_AREA);
         std::vector<cv::Rect> faces;
-        g_face.detectMultiScale(gray, faces, 1.2, 4, 0, cv::Size(W / 8, W / 8));
-        g_last_face = faces.empty() ? cv::Rect()
-            : *std::max_element(faces.begin(), faces.end(),
+        g_face.detectMultiScale(small, faces, 1.2, 4, 0, cv::Size(W / 16, W / 16));
+        if (faces.empty()) g_last_face = cv::Rect();
+        else {
+            cv::Rect f = *std::max_element(faces.begin(), faces.end(),
                   [](const cv::Rect &a, const cv::Rect &b){ return a.area() < b.area(); });
+            g_last_face = cv::Rect(f.x * 2, f.y * 2, f.width * 2, f.height * 2);
+        }
     }
     cv::Rect face_block;
     if (g_last_face.area() > 0) {
@@ -141,7 +151,7 @@ HandResult gesture_detect(const cv::Mat &frame_bgr,
     }
 
     /* --- 3. Clean up --- */
-    static const cv::Mat k = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(5, 5));
+    static const cv::Mat k = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(7, 7));
     cv::morphologyEx(mask, mask, cv::MORPH_OPEN,  k);
     cv::morphologyEx(mask, mask, cv::MORPH_CLOSE, k);
 
@@ -149,7 +159,9 @@ HandResult gesture_detect(const cv::Mat &frame_bgr,
 
     /* --- 4. Largest blob = hand --- */
     std::vector<std::vector<cv::Point>> contours;
-    cv::findContours(mask, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+    /* CHAIN_APPROX_NONE keeps every boundary pixel — needed so the
+     * fingertip average below has many points to work with. */
+    cv::findContours(mask, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_NONE);
 
     int    best = -1;
     double best_area = CFG_MIN_HAND_FRAC * W * H;   /* minimum size to count */
@@ -162,16 +174,19 @@ HandResult gesture_detect(const cv::Mat &frame_bgr,
     const std::vector<cv::Point> &hand = contours[best];
     r.hand_detected = true;
 
-    /* --- 5. Fingertip = topmost point ---
-     * Average the x of all points within 3 px of the top so the tip
-     * doesn't jitter between the two edges of the finger. */
-    int top_y = H;
-    for (const cv::Point &p : hand) top_y = std::min(top_y, p.y);
-    double sx = 0; int n = 0;
+    /* --- 5. Fingertip = top of the hand, averaged ---
+     * The single topmost pixel jumps around as the outline flickers.
+     * Instead, take every outline point within a small band below the top
+     * (4% of the hand's height) and average their x AND y. Averaging many
+     * points gives a sub-pixel position that moves smoothly. */
+    cv::Rect bb = cv::boundingRect(hand);
+    int top_y = bb.y;
+    int band  = std::max(3, bb.height / 25);
+    double sx = 0, sy = 0; int n = 0;
     for (const cv::Point &p : hand)
-        if (p.y <= top_y + 3) { sx += p.x; ++n; }
+        if (p.y <= top_y + band) { sx += p.x; sy += p.y; ++n; }
     r.tip_x = (float)(sx / n) / W;
-    r.tip_y = (float)top_y / H;
+    r.tip_y = (float)(sy / n) / H;
 
     /* Palm = centre of mass of the blob (image moments). */
     cv::Moments m = cv::moments(hand);

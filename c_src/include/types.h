@@ -68,25 +68,38 @@ typedef struct {
     float x0, y0, x1, y1;
 } ActiveBox;
 
+/* -----------------------------------------------------------------------
+ * Steadiness — One Euro filter settings (see controller.h).
+ *   min_cutoff : lower = steadier when still, but slightly laggier.
+ *                Adjust live with [ and ] in the preview.
+ *   beta       : how fast the filter "lets go" when you move quickly.
+ * ----------------------------------------------------------------------- */
 typedef struct {
-    SkinRange skin;
-    ActiveBox box;
+    float min_cutoff;   /* Hz */
+    float beta;
+} Steadiness;
+
+typedef struct {
+    SkinRange  skin;
+    ActiveBox  box;
+    Steadiness steady;
 } Calibration;
 
 /* -----------------------------------------------------------------------
  * Tuning constants
  * ----------------------------------------------------------------------- */
-#define CFG_FRAME_W         320    /* processing width; height follows the
-                                      camera's aspect ratio (no squish)     */
-#define CFG_PREVIEW_SCALE   2      /* preview window = processing size × 2  */
+#define CFG_FRAME_W         640    /* processing width; height follows the
+                                      camera's aspect ratio (no squish).
+                                      Higher = each camera pixel covers
+                                      fewer screen pixels = less shake.     */
+#define CFG_PREVIEW_SCALE   1      /* preview window = processing size × 1  */
 
 #define CFG_MIN_HAND_FRAC   0.015f /* hand must cover ≥1.5% of the frame    */
 #define CFG_FIST_SOLIDITY   0.86f  /* solidity above this = FIST            */
 #define CFG_POSE_FRAMES     3      /* frames a pose must hold to switch     */
 #define CFG_LOST_FRAMES     10     /* frames without a hand before release  */
 
-/* Cursor smoothing: small movements are smoothed heavily (kills jitter),
- * fast movements pass through almost directly (no lag).                   */
-#define CFG_SMOOTH_MIN      0.15f  /* EMA factor for tiny movements         */
-#define CFG_SMOOTH_FAST_PX  150.0f /* movement (px) that gets factor 1.0    */
-#define CFG_DEADZONE_PX     2.0f   /* ignore moves smaller than this        */
+/* One Euro filter defaults (tunable live with [ and ]). */
+#define CFG_EURO_MIN_CUTOFF 0.6f   /* Hz — steadiness when holding still    */
+#define CFG_EURO_BETA       0.004f /* speed responsiveness                  */
+#define CFG_EURO_D_CUTOFF   1.0f   /* Hz — smoothing of the speed estimate  */
