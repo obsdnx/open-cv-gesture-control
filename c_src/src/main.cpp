@@ -20,6 +20,7 @@
  *   pointer hand, index out   → move cursor
  *   pointer hand, fist        → hold mouse button (drag); open = release
  *   other hand, OK sign       → left click
+ *   open hand, swipe sideways → switch desktop
  *   no hand                   → trackpad works as normal
  *
  * KEYS (preview window focused)
@@ -37,6 +38,7 @@
 #include "gesture.h"
 #include "controller.h"
 #include "calibration.h"
+#include "swipe.h"
 #include <opencv2/imgproc.hpp>
 #include <opencv2/highgui.hpp>
 #include <CoreGraphics/CoreGraphics.h>
@@ -110,7 +112,11 @@ static void draw_preview(cv::Mat &img, const std::vector<Hand> &hands, const Han
 
     /* Status bar */
     const char *label; cv::Scalar col;
-    if (controller_now() < c.click_flash_until) { label = "CLICK!";                         col = COL_CLICKER; }
+    double now = controller_now();
+    if (now < c.swipe_flash_until)              { label = c.swipe_flash_dir > 0 ? "SWIPE -> next desktop"
+                                                                                : "SWIPE <- previous desktop";
+                                                  col = cv::Scalar(0, 220, 255); }
+    else if (now < c.click_flash_until)         { label = "CLICK!";                         col = COL_CLICKER; }
     else if (hr.count == 0)                     { label = "NO HAND - trackpad active";      col = cv::Scalar(150, 150, 150); }
     else if (c.paused)                          { label = "PAUSED - you used the trackpad"; col = cv::Scalar(150, 150, 150); }
     else if (c.pressed)                         { label = "PRESSED - dragging";             col = cv::Scalar(0, 140, 255); }
@@ -185,6 +191,7 @@ int main(int argc, char **argv)
 
     bool debug = false;
     cv::Mat frame;
+    SwipeDetector swipe = {};
 
     while (true) {
         if (!camera_read(&cam, &frame)) continue;
@@ -201,8 +208,11 @@ int main(int argc, char **argv)
             if (hr.hand[i].pose == POSE_POINT) { pointing = &hr.hand[i]; break; }
 
         bool calibrating = calib_step(&cs, pointing, &cal);
-        if (!calibrating)
+        if (!calibrating) {
             controller_update(&ctrl, &hr, &cal, scr_w, scr_h);
+            if (int dir = swipe_update(&swipe, &hr, controller_now()))
+                controller_switch_space(&ctrl, dir);
+        }
 
         draw_preview(frame, hands, hr, ctrl, cal, calibrating, debug, ms);
         calib_draw(&cs, frame);

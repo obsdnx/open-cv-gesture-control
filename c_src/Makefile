@@ -75,6 +75,7 @@ SRCS := src/main.cpp        \
         src/hand_model.cpp  \
         src/gesture.cpp     \
         src/calibration.cpp \
+        src/swipe.cpp       \
         src/controller.cpp
 
 # camera.mm is Objective-C++ (AVFoundation), built with its own rule below
