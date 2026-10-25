@@ -4,65 +4,60 @@
  * ARCHITECTURE OVERVIEW
  * =====================
  *
- *  camera.mm       — grabs live BGR frames from the built-in camera
+ *  camera.mm       — live BGR frames from the built-in camera
  *        │
  *        ▼
- *  gesture.cpp     — finds the hand (skin colour, face removed) and reports
- *        │           fingertip position + pose (POINT or FIST)
+ *  hand_model.cpp  — CNN: finds up to 2 hands, 21 joints each, left/right
+ *        │
  *        ▼
- *  controller.cpp  — maps fingertip → screen pixel, moves the cursor,
- *        │           grabs/moves the window under the cursor on FIST
+ *  gesture.cpp     — rules on the joints: POINT / FIST / OK per hand
+ *        │
  *        ▼
- *  main.cpp        — runs the per-frame loop, draws the preview
+ *  controller.cpp  — picks the POINTER hand and the CLICK hand, then:
+ *        │             pointer index finger → cursor position
+ *        │             pointer fist         → mouse button held (drag)
+ *        │             other hand OK sign   → left click
+ *        │             no hand              → nothing (trackpad works)
+ *        ▼
+ *  main.cpp        — per-frame loop, preview window, keys
  *
- *  calibration.cpp — guided setup (key C): samples your skin colour and
- *                    records how far your fingertip reaches, saved to disk
+ *  calibration.cpp — reach box + steadiness, saved to disk (key C)
  */
 
 #pragma once
 #include <stdbool.h>
 
 /* -----------------------------------------------------------------------
- * Pose — what the hand is doing this frame.
- *   POINT : hand open / finger pointing → cursor follows fingertip
- *   FIST  : hand closed                  → grab window under cursor
+ * Pose — what one hand is doing, decided from its 21 joints.
  * ----------------------------------------------------------------------- */
 typedef enum {
-    POSE_NONE  = 0,   /* no hand found */
-    POSE_POINT = 1,
-    POSE_FIST  = 2,
+    POSE_NONE  = 0,   /* unclear shape — ignored                          */
+    POSE_POINT = 1,   /* index finger extended (open hand counts too)     */
+    POSE_FIST  = 2,   /* all four fingers curled                          */
+    POSE_OK    = 3,   /* thumb tip touching index tip, other fingers out  */
 } Pose;
 
 /* -----------------------------------------------------------------------
- * HandResult — output of gesture_detect() for one frame.
- * All positions are normalised to [0,1] in the (mirrored) camera frame:
+ * HandInfo — one hand, reduced to what the controller needs.
+ * Positions are normalised to [0,1] in the mirrored camera frame:
  * (0,0) = top-left of the preview, (1,1) = bottom-right.
  * ----------------------------------------------------------------------- */
 typedef struct {
-    bool  hand_detected;
-    Pose  pose;          /* raw, per-frame (controller debounces it)        */
-    float tip_x, tip_y;  /* topmost point of the hand = fingertip           */
-    float palm_x, palm_y;/* centre of mass of the hand                      */
-    float solidity;      /* hand area / convex hull area (fist ≈ 1.0)       */
-} HandResult;
+    bool  is_right;        /* the person's right hand                    */
+    Pose  pose;
+    float tip_x, tip_y;    /* index fingertip (joint 8)                  */
+    float palm_x, palm_y;  /* centre of the palm                         */
+    float pinch;           /* thumb-tip↔index-tip gap ÷ palm size        */
+} HandInfo;
 
-/* -----------------------------------------------------------------------
- * SkinRange — HSV thresholds for "this pixel is skin".
- *
- * Hue is stored ROTATED by +90 (mod 180). Skin hue sits around red, which
- * wraps from 179 back to 0 in OpenCV's hue scale. Rotating moves red to
- * the middle (≈90) so one contiguous range [h_lo, h_hi] covers it.
- * ----------------------------------------------------------------------- */
 typedef struct {
-    int h_lo, h_hi;   /* rotated hue, 0–179 */
-    int s_lo, s_hi;   /* saturation,  0–255 */
-    int v_lo, v_hi;   /* brightness,  0–255 */
-} SkinRange;
+    int      count;        /* 0, 1 or 2 */
+    HandInfo hand[2];
+} HandsResult;
 
 /* -----------------------------------------------------------------------
  * ActiveBox — the part of the camera frame that maps to the whole screen.
- * Fingertip at (x0,y0) → screen top-left; at (x1,y1) → bottom-right.
- * Calibration sets this to the extremes you actually reached.
+ * Index fingertip at (x0,y0) → screen top-left; at (x1,y1) → bottom-right.
  * ----------------------------------------------------------------------- */
 typedef struct {
     float x0, y0, x1, y1;
@@ -70,9 +65,9 @@ typedef struct {
 
 /* -----------------------------------------------------------------------
  * Steadiness — One Euro filter settings (see controller.h).
- *   min_cutoff : lower = steadier when still, but slightly laggier.
+ *   min_cutoff : lower = steadier when still, slightly laggier.
  *                Adjust live with [ and ] in the preview.
- *   beta       : how fast the filter "lets go" when you move quickly.
+ *   beta       : how quickly smoothing relaxes when you move fast.
  * ----------------------------------------------------------------------- */
 typedef struct {
     float min_cutoff;   /* Hz */
@@ -80,7 +75,6 @@ typedef struct {
 } Steadiness;
 
 typedef struct {
-    SkinRange  skin;
     ActiveBox  box;
     Steadiness steady;
 } Calibration;
@@ -88,18 +82,27 @@ typedef struct {
 /* -----------------------------------------------------------------------
  * Tuning constants
  * ----------------------------------------------------------------------- */
-#define CFG_FRAME_W         640    /* processing width; height follows the
-                                      camera's aspect ratio (no squish).
-                                      Higher = each camera pixel covers
-                                      fewer screen pixels = less shake.     */
-#define CFG_PREVIEW_SCALE   1      /* preview window = processing size × 1  */
+#define CFG_FRAME_W         640    /* processing width (height keeps aspect) */
+#define CFG_PREVIEW_SCALE   1      /* preview window = processing size × 1   */
 
-#define CFG_MIN_HAND_FRAC   0.015f /* hand must cover ≥1.5% of the frame    */
-#define CFG_FIST_SOLIDITY   0.86f  /* solidity above this = FIST            */
-#define CFG_POSE_FRAMES     3      /* frames a pose must hold to switch     */
-#define CFG_LOST_FRAMES     10     /* frames without a hand before release  */
+#define CFG_POSE_FRAMES     3      /* frames a pose must hold to count       */
+#define CFG_LOST_FRAMES     6      /* frames without the hand before letting
+                                      go of the mouse button                 */
+
+/* Gesture thresholds (relative to palm size, so distance from camera
+ * doesn't matter). Press D in the preview to see live values. */
+#define CFG_FINGER_OUT      1.10f  /* tip this much farther from the wrist
+                                      than the middle joint = extended       */
+#define CFG_OK_PINCH        0.65f  /* thumb–index gap below this = touching.
+                                      (Fist also scores ~0.5 — OK is told
+                                      apart by the other 3 fingers being out) */
+
+/* Trackpad takeover: if the cursor moves by more than this many pixels
+ * without us moving it, you're using the trackpad — camera control pauses. */
+#define CFG_TRACKPAD_PX     25.0f
+#define CFG_TRACKPAD_PAUSE  1.0    /* seconds */
 
 /* One Euro filter defaults (tunable live with [ and ]). */
-#define CFG_EURO_MIN_CUTOFF 0.6f   /* Hz — steadiness when holding still    */
-#define CFG_EURO_BETA       0.004f /* speed responsiveness                  */
-#define CFG_EURO_D_CUTOFF   1.0f   /* Hz — smoothing of the speed estimate  */
+#define CFG_EURO_MIN_CUTOFF 0.6f
+#define CFG_EURO_BETA       0.004f
+#define CFG_EURO_D_CUTOFF   1.0f

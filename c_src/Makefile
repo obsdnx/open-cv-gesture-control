@@ -33,11 +33,17 @@ OPENCV_LIBS   := -L$(OPENCV_PREFIX)/lib \
                  -lopencv_core     \
                  -lopencv_imgproc  \
                  -lopencv_geometry \
-                 -lopencv_xobjdetect \
+                 -lopencv_dnn      \
                  -lopencv_highgui
 
-# Haar face detector shipped with OpenCV (used to ignore your face)
-FACE_CASCADE  := $(OPENCV_PREFIX)/share/opencv5/haarcascades/haarcascade_frontalface_default.xml
+# ---------------------------------------------------------------------------
+# Hand CNN models (Google MediaPipe, Apache-2.0). `make models` downloads
+# the .task bundle and unzips the two .tflite networks into models/.
+# The absolute path is baked into the binary so it runs from anywhere.
+# ---------------------------------------------------------------------------
+MODEL_DIR := $(CURDIR)/models
+MODEL_URL := https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task
+MODELS    := $(MODEL_DIR)/hand_detector.tflite $(MODEL_DIR)/hand_landmarks_detector.tflite
 
 # ---------------------------------------------------------------------------
 # macOS system frameworks
@@ -60,12 +66,13 @@ MAC_FRAMEWORKS := -framework AVFoundation         \
 # ---------------------------------------------------------------------------
 # Include paths: our own headers + OpenCV
 # ---------------------------------------------------------------------------
-INCLUDES := -I include -I $(OPENCV_INC) -DFACE_CASCADE='"$(FACE_CASCADE)"'
+INCLUDES := -I include -I $(OPENCV_INC) -DMODEL_DIR='"$(MODEL_DIR)"'
 
 # ---------------------------------------------------------------------------
 # Source files and derived object paths
 # ---------------------------------------------------------------------------
 SRCS := src/main.cpp        \
+        src/hand_model.cpp  \
         src/gesture.cpp     \
         src/calibration.cpp \
         src/controller.cpp
@@ -79,7 +86,17 @@ TARGET := gesture_control
 # Rules
 # ---------------------------------------------------------------------------
 
-# Default target: build the binary
+# Default target: models + binary
+all: $(MODELS) $(TARGET)
+
+# Download and unpack the hand models (only if missing)
+$(MODELS):
+	mkdir -p $(MODEL_DIR)
+	curl -L --fail -o $(MODEL_DIR)/hand_landmarker.task $(MODEL_URL)
+	cd $(MODEL_DIR) && unzip -o -q hand_landmarker.task && rm hand_landmarker.task
+
+models: $(MODELS)
+
 $(TARGET): $(OBJS)
 	$(CXX) $(CXXFLAGS) $(OBJS) -o $(TARGET) \
 	    $(OPENCV_LIBS) $(MAC_FRAMEWORKS) \
@@ -107,7 +124,7 @@ build:
 clean:
 	rm -rf build $(TARGET)
 
-run: $(TARGET)
+run: all
 	./$(TARGET)
 
-.PHONY: clean run
+.PHONY: all models clean run
