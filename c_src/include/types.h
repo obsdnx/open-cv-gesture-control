@@ -1,97 +1,105 @@
 /*
- * types.h — shared types used across all modules
+ * types.h — shared types and tuning constants
  *
  * ARCHITECTURE OVERVIEW
  * =====================
- * The program has four layers, each in its own file:
  *
- *  camera.cpp      — grabs raw BGR frames from the webcam
- *        |
- *        v
- *  gesture.cpp     — skin-color segmentation + convex-hull finger counting
- *        |
- *        v
- *  controller.cpp  — translates a Gesture into macOS CoreGraphics events
- *        |
- *        v
- *  main.cpp        — ties everything together; runs the per-frame loop
+ *  camera.mm       — grabs live BGR frames from the built-in camera
+ *        │
+ *        ▼
+ *  gesture.cpp     — finds the hand (skin colour, face removed) and reports
+ *        │           fingertip position + pose (POINT or FIST)
+ *        ▼
+ *  controller.cpp  — maps fingertip → screen pixel, moves the cursor,
+ *        │           grabs/moves the window under the cursor on FIST
+ *        ▼
+ *  main.cpp        — runs the per-frame loop, draws the preview
  *
- * This header defines the data types that flow between those layers.
- * Everything is plain C structs and enums so the interfaces are simple
- * to read even if the implementation files use C++ (for OpenCV).
+ *  calibration.cpp — guided setup (key C): samples your skin colour and
+ *                    records how far your fingertip reaches, saved to disk
  */
 
 #pragma once
 #include <stdbool.h>
 
 /* -----------------------------------------------------------------------
- * Gesture — the set of hand poses we recognise.
- *
- * Detection is done by counting "valleys" between raised fingers using
- * convexity defects on the hand contour.  No neural network is involved,
- * so it runs fast on CPU.
- *
- *  Fist  (0 fingers up) → DRAG   — hold the mouse button while moving
- *  Index (1 finger up)  → POINTER — move the cursor
- *  Peace (2 fingers up) → SCROLL  — scroll up/down
- *  Three (3 fingers up) → SWITCH_WINDOW — Cmd+Tab
- *  Four  (4 fingers up) → MINIMIZE      — Cmd+M
- *  Open  (5 fingers up) → MAXIMIZE      — Cmd+Ctrl+F
+ * Pose — what the hand is doing this frame.
+ *   POINT : hand open / finger pointing → cursor follows fingertip
+ *   FIST  : hand closed                  → grab window under cursor
  * ----------------------------------------------------------------------- */
 typedef enum {
-    GESTURE_NONE          = 0,
-    GESTURE_POINTER       = 1,   /* index only  — cursor mode            */
-    GESTURE_DRAG          = 2,   /* fist        — click-hold drag         */
-    GESTURE_SCROLL        = 3,   /* peace sign  — scroll wheel            */
-    GESTURE_SWITCH_WINDOW = 4,   /* 3 fingers   — Cmd+Tab                */
-    GESTURE_MINIMIZE      = 5,   /* 4 fingers   — Cmd+M                  */
-    GESTURE_MAXIMIZE      = 6,   /* open hand   — Cmd+Ctrl+F             */
-} Gesture;
+    POSE_NONE  = 0,   /* no hand found */
+    POSE_POINT = 1,
+    POSE_FIST  = 2,
+} Pose;
 
 /* -----------------------------------------------------------------------
- * GestureResult — everything gesture.cpp tells the controller.
- *
- *  gesture       — which pose was detected
- *  norm_x/norm_y — cursor position, normalised to [0, 1] inside the
- *                  active region of the camera frame.  (0,0) = top-left.
- *  finger_count  — raw finger count (0-5) for debug display
- *  hand_detected — false when no hand contour was found
+ * HandResult — output of gesture_detect() for one frame.
+ * All positions are normalised to [0,1] in the (mirrored) camera frame:
+ * (0,0) = top-left of the preview, (1,1) = bottom-right.
  * ----------------------------------------------------------------------- */
 typedef struct {
-    Gesture gesture;
-    float   norm_x;
-    float   norm_y;
-    int     finger_count;
-    bool    hand_detected;
-} GestureResult;
+    bool  hand_detected;
+    Pose  pose;          /* raw, per-frame (controller debounces it)        */
+    float tip_x, tip_y;  /* topmost point of the hand = fingertip           */
+    float palm_x, palm_y;/* centre of mass of the hand                      */
+    float solidity;      /* hand area / convex hull area (fist ≈ 1.0)       */
+} HandResult;
 
 /* -----------------------------------------------------------------------
- * ControllerState — mutable state the controller carries between frames.
+ * SkinRange — HSV thresholds for "this pixel is skin".
  *
- * The controller uses this to implement:
- *   - cursor smoothing  (exponential moving average)
- *   - gesture debounce  (require N consecutive identical frames)
- *   - drag state        (track whether mouseDown is currently held)
- *   - scroll reference  (store the y position where scrolling started)
+ * Hue is stored ROTATED by +90 (mod 180). Skin hue sits around red, which
+ * wraps from 179 back to 0 in OpenCV's hue scale. Rotating moves red to
+ * the middle (≈90) so one contiguous range [h_lo, h_hi] covers it.
  * ----------------------------------------------------------------------- */
 typedef struct {
-    float   cursor_x;          /* smoothed screen X, pixels              */
-    float   cursor_y;          /* smoothed screen Y, pixels              */
-    bool    is_dragging;       /* true while mouseDown is held            */
-    Gesture prev_gesture;      /* gesture seen in the previous frame      */
-    int     gesture_hold;      /* consecutive frames with same gesture    */
-    float   scroll_ref_y;      /* normalised Y when scrolling started     */
-    bool    scroll_active;     /* true once a scroll session has begun    */
-} ControllerState;
+    int h_lo, h_hi;   /* rotated hue, 0–179 */
+    int s_lo, s_hi;   /* saturation,  0–255 */
+    int v_lo, v_hi;   /* brightness,  0–255 */
+} SkinRange;
 
 /* -----------------------------------------------------------------------
- * Config — compile-time constants, editable here.
+ * ActiveBox — the part of the camera frame that maps to the whole screen.
+ * Fingertip at (x0,y0) → screen top-left; at (x1,y1) → bottom-right.
+ * Calibration sets this to the extremes you actually reached.
  * ----------------------------------------------------------------------- */
-#define CFG_FRAME_W        320    /* capture width  (pixels)              */
-#define CFG_FRAME_H        240    /* capture height (pixels)              */
-#define CFG_FPS            30     /* target frames per second             */
-#define CFG_SMOOTHING      0.25f  /* cursor EMA factor  (0=none, 1=jump) */
-#define CFG_HOLD_FRAMES    3      /* frames before one-shot action fires  */
-#define CFG_SCROLL_SPEED   10.0f  /* scroll lines per unit dy             */
-#define CFG_MARGIN         0.10f  /* dead-zone margin at camera edges     */
-#define CFG_MIN_HAND_AREA  3000   /* minimum contour px² to be a hand    */
+typedef struct {
+    float x0, y0, x1, y1;
+} ActiveBox;
+
+/* -----------------------------------------------------------------------
+ * Steadiness — One Euro filter settings (see controller.h).
+ *   min_cutoff : lower = steadier when still, but slightly laggier.
+ *                Adjust live with [ and ] in the preview.
+ *   beta       : how fast the filter "lets go" when you move quickly.
+ * ----------------------------------------------------------------------- */
+typedef struct {
+    float min_cutoff;   /* Hz */
+    float beta;
+} Steadiness;
+
+typedef struct {
+    SkinRange  skin;
+    ActiveBox  box;
+    Steadiness steady;
+} Calibration;
+
+/* -----------------------------------------------------------------------
+ * Tuning constants
+ * ----------------------------------------------------------------------- */
+#define CFG_FRAME_W         640    /* processing width; height follows the
+                                      camera's aspect ratio (no squish).
+                                      Higher = each camera pixel covers
+                                      fewer screen pixels = less shake.     */
+#define CFG_PREVIEW_SCALE   1      /* preview window = processing size × 1  */
+
+#define CFG_MIN_HAND_FRAC   0.015f /* hand must cover ≥1.5% of the frame    */
+#define CFG_FIST_SOLIDITY   0.86f  /* solidity above this = FIST            */
+#define CFG_POSE_FRAMES     3      /* frames a pose must hold to switch     */
+#define CFG_LOST_FRAMES     10     /* frames without a hand before release  */
+
+/* One Euro filter defaults (tunable live with [ and ]). */
+#define CFG_EURO_MIN_CUTOFF 0.6f   /* Hz — steadiness when holding still    */
+#define CFG_EURO_BETA       0.004f /* speed responsiveness                  */
+#define CFG_EURO_D_CUTOFF   1.0f   /* Hz — smoothing of the speed estimate  */

@@ -47,7 +47,7 @@
     std::condition_variable ready;    /* signalled on every new frame       */
     cv::Mat                 latest;   /* newest frame, BGR, output size     */
     uint64_t                seq;      /* increments per frame               */
-    int                     out_w, out_h;
+    int                     out_w;    /* output width; height keeps aspect  */
 }
 @end
 
@@ -69,11 +69,15 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
     size_t stride = CVPixelBufferGetBytesPerRow(pb);   /* may include padding */
     void  *base   = CVPixelBufferGetBaseAddress(pb);
 
+    /* Output height preserves the sensor's aspect ratio. Forcing a fixed
+     * 4:3 size onto a 16:9 sensor is what made the image look squished. */
+    int out_h = (int)lround((double)out_w * h / w);
+
     /* Wrap the buffer as a cv::Mat WITHOUT copying (BGRA, 4 bytes/pixel),
      * then resize + drop alpha into our own memory before unlocking.     */
     cv::Mat bgra(h, w, CV_8UC4, base, stride);
     cv::Mat small, bgr;
-    if (w != out_w || h != out_h)
+    if (w != out_w)
         cv::resize(bgra, small, cv::Size(out_w, out_h), 0, 0, cv::INTER_AREA);
     else
         small = bgra;
@@ -174,7 +178,7 @@ static bool ensure_permission(void)
  * SECTION 5 — PUBLIC API
  * ========================================================================= */
 
-int camera_open(Camera *cam, int device, int width, int height)
+int camera_open(Camera *cam, int device, int width)
 {
     cam->impl = nullptr;
     if (!ensure_permission()) return -1;
@@ -204,9 +208,10 @@ int camera_open(Camera *cam, int device, int width, int height)
 
     /* --- Build the session --- */
     AVCaptureSession *session = [[AVCaptureSession alloc] init];
-    /* 640x480 is cheap to transfer; we resize down further in the grabber. */
-    if ([session canSetSessionPreset:AVCaptureSessionPreset640x480])
-        session.sessionPreset = AVCaptureSessionPreset640x480;
+    /* 1280x720 is the native 16:9 mode of Mac FaceTime cameras — full
+     * field of view, no cropping. The grabber shrinks it to `width`.    */
+    if ([session canSetSessionPreset:AVCaptureSessionPreset1280x720])
+        session.sessionPreset = AVCaptureSessionPreset1280x720;
 
     NSError *err = nil;
     AVCaptureDeviceInput *input = [AVCaptureDeviceInput deviceInputWithDevice:dev error:&err];
@@ -228,7 +233,6 @@ int camera_open(Camera *cam, int device, int width, int height)
     FrameGrabber *grabber = [[FrameGrabber alloc] init];
     grabber->seq   = 0;
     grabber->out_w = width;
-    grabber->out_h = height;
 
     dispatch_queue_t queue = dispatch_queue_create("camera.frames", DISPATCH_QUEUE_SERIAL);
     [output setSampleBufferDelegate:grabber queue:queue];
@@ -244,10 +248,8 @@ int camera_open(Camera *cam, int device, int width, int height)
     CameraImpl *impl = new CameraImpl{session, grabber, queue, 0};
     cam->impl   = impl;
     cam->width  = width;
-    cam->height = height;
 
-    printf("[camera] Using \"%s\" (%dx%d)\n",
-           dev.localizedName.UTF8String, width, height);
+    printf("[camera] Using \"%s\"\n", dev.localizedName.UTF8String);
     return 0;
 }
 

@@ -1,67 +1,61 @@
 /*
- * gesture.h — hand detection and gesture recognition API
+ * gesture.h — find the hand, its fingertip, and whether it is a fist
  *
- * HOW GESTURE DETECTION WORKS (no neural network)
- * ================================================
- * Instead of a deep learning model we use classical computer vision:
+ * PIPELINE (per frame, no neural network)
+ * =======================================
  *
- *  Step 1 — SKIN SEGMENTATION
- *    Convert the BGR frame to HSV colour space.  Skin tone occupies a
- *    consistent hue band (roughly H=0-25 and the wrap-around H=160-180).
- *    cv::inRange() creates a binary mask: white = skin, black = background.
- *    Morphological erode+dilate ("opening") removes noise speckles.
+ *  1. SKIN MASK
+ *     BGR → HSV, rotate hue so red is contiguous, keep pixels inside the
+ *     calibrated SkinRange. Result: white = skin, black = everything else.
  *
- *  Step 2 — CONTOUR EXTRACTION
- *    cv::findContours() traces the boundary of every white blob.
- *    We keep only the largest one — that's the hand.
- *    Tiny blobs (area < CFG_MIN_HAND_AREA) are discarded.
+ *  2. REMOVE THE FACE
+ *     Your face is skin-coloured and usually bigger than your hand, so it
+ *     would "win". A Haar cascade face detector finds the face, and we
+ *     black out that rectangle (extended down to cover the neck).
  *
- *  Step 3 — CONVEX HULL + CONVEXITY DEFECTS
- *    The convex hull is the rubber-band shape stretched around the hand.
- *    Fingers poking out create "peaks"; the gaps between fingers create
- *    inward dents called "convexity defects".
+ *  3. CLEAN UP
+ *     Morphological open (removes specks) + close (fills holes).
  *
- *    Each defect is described by:
- *      start  — hull point where the dent begins
- *      end    — hull point where the dent ends
- *      far    — the deepest point of the dent (fingertip valley)
- *      depth  — how deep the dent is (in pixels × 256)
+ *  4. LARGEST BLOB = HAND
+ *     cv::findContours traces every white blob; the biggest is the hand.
  *
- *  Step 4 — FINGER COUNTING
- *    For each defect we check two criteria:
- *      a) depth > 30% of palm radius  (filters shallow palm wrinkles)
- *      b) angle at the far point < 90° (finger valleys are acute)
- *    valid_valleys = defects that pass both tests
- *    finger_count  = valid_valleys + 1   (n valleys → n+1 fingers)
+ *  5. FINGERTIP = TOPMOST POINT
+ *     Your arm enters from below, so the highest point of the blob is the
+ *     tip of your highest finger. This is what drives the cursor.
  *
- *    Special case: 0 valleys could mean a fist OR a single pointing
- *    finger.  We disambiguate by comparing contour area to hull area:
- *      ratio ≈ 1.0 → compact shape → FIST (0 fingers)
- *      ratio < 0.85 → elongated   → POINTER (1 finger)
- *
- *  Step 5 — CURSOR POSITION
- *    For cursor movement we use the topmost point of the hand contour
- *    (which corresponds to the raised fingertip) normalised to [0,1].
+ *  6. POSE FROM SOLIDITY
+ *     solidity = blob area / convex hull area.
+ *       Fist           → compact, almost convex     → solidity ≈ 0.9+
+ *       Pointing/open  → fingers leave gaps in hull → solidity lower
+ *     solidity > CFG_FIST_SOLIDITY → FIST, else POINT.
+ *     Press D in the preview to see the live solidity value and tune it.
  */
 
 #pragma once
-#include <opencv2/opencv.hpp>
+#include <opencv2/core.hpp>
+#include <vector>
 #include "types.h"
 
-/*
- * gesture_detect — analyse a BGR frame and return a GestureResult.
- *
- *   frame : BGR image straight from the camera (NOT flipped yet;
- *           flipping happens in main before display).
- *
- * The function is stateless: it does not remember previous frames.
- * Debounce and smoothing live in controller.cpp.
- */
-GestureResult gesture_detect(const cv::Mat &frame_bgr);
+/* Extra data for the debug overlay (key D). Not needed for control. */
+struct GestureDebug {
+    cv::Mat                mask;      /* final skin mask, CV_8U             */
+    std::vector<cv::Point> contour;   /* hand outline, processing pixels    */
+    std::vector<cv::Point> hull;      /* convex hull of the hand            */
+    cv::Rect               face;      /* removed face area (may be empty)   */
+};
 
-/*
- * gesture_draw_debug — overlay the skin mask, hull, and defect points
- * onto a copy of the frame.  Call this to visualise what the detector
- * "sees".  Only compiled in debug builds (controlled by CMake/CFLAGS).
- */
-void gesture_draw_debug(cv::Mat &frame, const GestureResult &result);
+/* Load the face detector. Call once at startup. Returns false if the
+ * cascade file is missing (detection still works, just without face removal). */
+bool gesture_init(void);
+
+/* Analyse one mirrored BGR frame. `dbg` may be NULL. */
+HandResult gesture_detect(const cv::Mat &frame_bgr,
+                          const SkinRange &skin,
+                          GestureDebug *dbg);
+
+/* Measure the skin colour inside `roi` and return a SkinRange around it.
+ * Used by calibration while your hand covers the box on screen. */
+SkinRange gesture_sample_skin(const cv::Mat &frame_bgr, const cv::Rect &roi);
+
+/* Reasonable starting range for most skin tones under indoor light. */
+SkinRange gesture_default_skin(void);

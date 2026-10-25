@@ -19,7 +19,7 @@
  *
  * USAGE:
  *   Camera cam;
- *   camera_open(&cam, CAMERA_AUTO, 320, 240);
+ *   camera_open(&cam, CAMERA_AUTO, 320);
  *   cv::Mat frame;
  *   while (camera_read(&cam, &frame)) { ... }
  *   camera_close(&cam);
@@ -34,8 +34,8 @@
 
 typedef struct {
     void *impl;    /* CameraImpl* (Objective-C++ internals, see camera.mm) */
-    int   width;   /* size of frames returned by camera_read               */
-    int   height;
+    int   width;   /* width of frames returned by camera_read; height is
+                      derived from the camera's aspect ratio (no squish)    */
 } Camera;
 
 /* Print every camera macOS can see, with the index to pass to --camera. */
@@ -44,11 +44,11 @@ void camera_list(void);
 /*
  * camera_open — start capturing.
  *   device : CAMERA_AUTO (built-in camera) or an index from camera_list()
- *   width/height : size of the frames handed to the caller (resized
- *                  from the 640x480 sensor stream)
+ *   width  : width of the frames handed to the caller. Height is computed
+ *            from the sensor's aspect ratio so the image is never stretched.
  * Returns 0 on success, -1 on failure (prints the reason).
  */
-int  camera_open (Camera *cam, int device, int width, int height);
+int  camera_open (Camera *cam, int device, int width);
 
 /*
  * camera_read — wait for the NEXT new frame (up to 2 s) and copy it out.
