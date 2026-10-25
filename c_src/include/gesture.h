@@ -19,7 +19,8 @@
  *   OK    : thumb tip near index tip  (gap < CFG_OK_PINCH × palm size)
  *           AND at least two of middle/ring/pinky extended
  *   FIST  : index, middle, ring and pinky all curled
- *   POINT : index extended (whatever the others do)
+ *   OPEN  : index, middle, ring and pinky all extended (flat hand)
+ *   POINT : index extended, but not all four
  *   NONE  : anything else
  *
  *   "palm size" = distance wrist → middle knuckle, so all thresholds

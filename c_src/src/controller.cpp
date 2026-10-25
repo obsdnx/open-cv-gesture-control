@@ -34,6 +34,42 @@ static CGPoint cursor_now(void)
 
 double controller_now(void) { return (double)CFAbsoluteTimeGetCurrent(); }
 
+/* Press Ctrl + an arrow key. macOS's default shortcuts "Move left/right a
+ * space" (System Settings > Keyboard > Keyboard Shortcuts > Mission
+ * Control) switch desktops on Ctrl+← / Ctrl+→. Arrow keys always carry
+ * the Fn and numeric-pad flags on a real keyboard, so we set them too —
+ * without them macOS may ignore the synthetic shortcut. */
+static void ctrl_arrow(CGKeyCode key)
+{
+    CGEventFlags flags = (CGEventFlags)(kCGEventFlagMaskControl |
+                                        kCGEventFlagMaskSecondaryFn |
+                                        kCGEventFlagMaskNumericPad);
+    CGEventRef down = CGEventCreateKeyboardEvent(NULL, key, true);
+    CGEventRef up   = CGEventCreateKeyboardEvent(NULL, key, false);
+    CGEventSetFlags(down, flags);
+    CGEventSetFlags(up,   flags);
+    CGEventPost(kCGHIDEventTap, down);
+    CGEventPost(kCGHIDEventTap, up);
+    CFRelease(down);
+    CFRelease(up);
+}
+
+void controller_switch_space(ControllerState *s, int hand_dir)
+{
+    if (s->paused) return;
+    controller_release(s);
+
+    static const CGKeyCode KEY_LEFT = 0x7B, KEY_RIGHT = 0x7C;
+    /* Natural (trackpad-like): hand moves left → content slides left →
+     * you arrive at the desktop on the RIGHT. */
+    int space_dir = CFG_SWIPE_NATURAL ? -hand_dir : hand_dir;
+    ctrl_arrow(space_dir > 0 ? KEY_RIGHT : KEY_LEFT);
+
+    s->swipe_flash_until = controller_now() + 0.6;
+    s->swipe_flash_dir   = space_dir;
+    printf("[control] swipe -> desktop %s\n", space_dir > 0 ? "right" : "left");
+}
+
 /* =========================================================================
  * SECTION 2 — ONE EURO FILTER
  * ========================================================================= */
@@ -227,14 +263,20 @@ void controller_update(ControllerState *s, const HandsResult *h,
     s->ptr_known    = true;
     s->ptr_is_right = p.is_right;
 
-    /* Debounce: only POINT and FIST change what the pointer does. */
+    /* Debounce: POINT, FIST and OPEN change what the pointer does. */
     if (p.pose == s->ptr_cand) ++s->ptr_cand_n;
     else { s->ptr_cand = p.pose; s->ptr_cand_n = 1; }
     if (s->ptr_cand_n >= CFG_POSE_FRAMES &&
-        (s->ptr_cand == POSE_POINT || s->ptr_cand == POSE_FIST))
+        (s->ptr_cand == POSE_POINT || s->ptr_cand == POSE_FIST || s->ptr_cand == POSE_OPEN))
         s->ptr_stable = s->ptr_cand;
 
     const ActiveBox &box = cal->box;
+
+    /* Open hand = getting ready to swipe: let go, keep the cursor still. */
+    if (s->ptr_stable == POSE_OPEN) {
+        controller_release(s);
+        return;
+    }
 
     if (s->ptr_stable == POSE_POINT) {
         controller_release(s);

@@ -32,9 +32,10 @@
  * ----------------------------------------------------------------------- */
 typedef enum {
     POSE_NONE  = 0,   /* unclear shape — ignored                          */
-    POSE_POINT = 1,   /* index finger extended (open hand counts too)     */
+    POSE_POINT = 1,   /* index finger out, not all four fingers out       */
     POSE_FIST  = 2,   /* all four fingers curled                          */
     POSE_OK    = 3,   /* thumb tip touching index tip, other fingers out  */
+    POSE_OPEN  = 4,   /* all four fingers out — flat hand, used to swipe  */
 } Pose;
 
 /* -----------------------------------------------------------------------
@@ -101,6 +102,16 @@ typedef struct {
  * without us moving it, you're using the trackpad — camera control pauses. */
 #define CFG_TRACKPAD_PX     25.0f
 #define CFG_TRACKPAD_PAUSE  1.0    /* seconds */
+
+/* Swipe = open hand moving sideways fast (see swipe.h). */
+#define CFG_SWIPE_DIST      0.30f  /* fraction of frame width to travel     */
+#define CFG_SWIPE_TIME      0.60   /* …within this many seconds             */
+#define CFG_SWIPE_SAME_GAP  0.50   /* min time between same-direction swipes */
+#define CFG_SWIPE_RETURN    1.00   /* opposite direction blocked this long
+                                      (that's your hand swinging back)      */
+#define CFG_SWIPE_NATURAL   1      /* 1: like the trackpad — swipe left goes
+                                      to the desktop on the right.
+                                      0: swipe left goes to the left one.   */
 
 /* One Euro filter defaults (tunable live with [ and ]). */
 #define CFG_EURO_MIN_CUTOFF 0.6f

@@ -16,6 +16,9 @@
  *   CLICKER, OK sign          → one left click at the cursor
  *                               (fires once per OK; relax and redo for
  *                               another click)
+ *   ANY HAND, open + swipe    → switch desktop (Ctrl+← / Ctrl+→, see
+ *                               swipe.h). While the hand is open the
+ *                               cursor holds still and the button is up.
  *
  * TRACKPAD
  *   No hand on camera → this program sends nothing; the trackpad works
@@ -82,6 +85,8 @@ typedef struct {
     /* ---- clicker hand ---- */
     int   ok_n;                     /* consecutive OK frames              */
     double click_flash_until;       /* for the preview: show "CLICK"      */
+    double swipe_flash_until;       /* for the preview: show the swipe    */
+    int    swipe_flash_dir;         /* +1 desktop right, -1 left          */
 
     /* ---- trackpad takeover ---- */
     bool   posted;                  /* did we move the cursor last frame? */
@@ -101,6 +106,9 @@ bool controller_init(ControllerState *s);
 /* Process one frame of hands. */
 void controller_update(ControllerState *s, const HandsResult *hands,
                        const Calibration *cal, int scr_w, int scr_h);
+
+/* A swipe was detected (hand_dir from swipe_update): switch desktop. */
+void controller_switch_space(ControllerState *s, int hand_dir);
 
 /* Let go of the mouse button if held (call on exit / calibration). */
 void controller_release(ControllerState *s);

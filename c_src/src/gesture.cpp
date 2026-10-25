@@ -46,6 +46,7 @@ HandInfo gesture_classify(const Hand &h, int W, int H)
      * finger is bent, which would otherwise look like "not pointing". */
     if (r.pinch < CFG_OK_PINCH && (middle + ring + pinky) >= 2) r.pose = POSE_OK;
     else if (!index && !middle && !ring && !pinky)                r.pose = POSE_FIST;
+    else if (index && middle && ring && pinky)                    r.pose = POSE_OPEN;
     else if (index)                                               r.pose = POSE_POINT;
     else                                                          r.pose = POSE_NONE;
 
@@ -78,6 +79,7 @@ const char *pose_name(Pose p)
         case POSE_POINT: return "POINT";
         case POSE_FIST:  return "FIST";
         case POSE_OK:    return "OK";
+        case POSE_OPEN:  return "OPEN";
         default:         return "-";
     }
 }
